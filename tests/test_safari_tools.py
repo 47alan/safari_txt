@@ -672,10 +672,82 @@ class BrowserTests(unittest.TestCase):
 
     def test_reader_sudugu_new_domain_uses_the_same_profile(self):
         self.pages = {"/12/2.html": SUDUGU_PAGE}
-        self.page.goto("https://www.suduguu.com/12/2.html")
-        self.inject(("reader",))
-        expect(self.page.locator(READER)).to_be_visible()  # The configured new domain keeps the same site profile.
-        expect(self.page.locator("#__rd_content p")).to_have_count(30)
+        for host in ("suduguu.com", "www.suduguu.com", "m.suduguu.com"):
+            with self.subTest(host=host):
+                self.page.goto(f"https://{host}/12/2.html")
+                self.inject(("reader",))
+                expect(self.page.locator(READER)).to_be_visible()
+                expect(self.page.locator("#__rd_content p")).to_have_count(30)
+                expect(self.page.locator("#__rd_bar .t")).to_have_text("第一章 开端")
+
+    def test_reader_domain_config_normalizes_addresses_without_broadening_matches(self):
+        source = SCRIPTS["reader"].read_text(encoding="utf-8")
+        functions = re.search(r"  function normalizeDomain\(raw\) \{.*?(?=\n  // 当前网站命中的配置)", source, re.S).group()
+        check = "([domains, host]) => { const location = {hostname: host};\n" + functions + "\nreturn hostMatches(domains); }"
+        cases = [
+            (["suduguu.com"], "suduguu.com", True),
+            (["suduguu.com"], "m.suduguu.com", True),
+            (["sudugu.org"], "www.sudugu.org", True),
+            (["  SUDUGUU.COM  "], "WWW.SUDUGUU.COM", True),
+            (["https://suduguu.com/12/2.html?from=test#text"], "www.suduguu.com", True),
+            (["http://suduguu.com:8080/12/2.html"], "suduguu.com", True),
+            (["suduguu.com/12/2.html"], "suduguu.com", True),
+            (["//suduguu.com/12/2.html"], "suduguu.com", True),
+            (["https://SUDUGUU.COM./12/2.html"], "www.suduguu.com.", True),
+            (["https://www.suduguu.com/12/2.html"], "www.suduguu.com", True),
+            (["www.suduguu.com"], "suduguu.com", False),
+            (["www.suduguu.com"], "m.suduguu.com", False),
+            (["suduguu.com"], "not-suduguu.com", False),
+            (["suduguu.com"], "suduguu.com.example.org", False),
+            (["suduguu.com"], "", False),
+            ([], "suduguu.com", False),
+            ([None, 42, {}, [], "not a url", "suduguu.com"], "suduguu.com", True),
+            (["hl365.com/some/page"], "www.hl365.com", True),
+        ]
+        for value in (None, 42, {}, [], "", "  ", "not a url", "*", "*.suduguu.com", ".suduguu.com",
+                      "https://", "https://suduguu..com", "https://-suduguu.com", "https://suduguu.com..",
+                      "https://sudu guu.com", "https://sudu\nguu.com", "https://suduguu.com\\other",
+                      "ftp://suduguu.com/", "javascript:alert(1)", "mailto:user@suduguu.com",
+                      "https://user:pass@suduguu.com/", "https://other.example@suduguu.com/"):
+            cases.append(([value], "suduguu.com", False))
+        for domains, host, expected in cases:
+            with self.subTest(domains=domains, host=host):
+                self.assertEqual(self.page.evaluate(check, [domains, host]), expected)
+
+    def test_reader_custom_domain_config_applies_profile_and_blocker_at_start(self):
+        self.pages = {"/12/2.html": SUDUGU_PAGE}
+        source = SCRIPTS["reader"].read_text(encoding="utf-8")
+        # 模拟用户只改顶部 SITES 列表里速读谷的域名，直接粘贴新网址；前面的错误条目不能阻止有效配置生效。
+        domains = [None, "ftp://reader-alias.test/", "  https://READER-ALIAS.TEST/12/2.html?source=test#text  "]
+        source, replacements = re.subn(r"      domains: \[.*?\],",
+                                       lambda _: "      domains: " + json.dumps(domains) + ",",
+                                       source, count=1, flags=re.S)
+        self.assertEqual(replacements, 1)
+        self.page.add_init_script("window.__originalAppend = Node.prototype.appendChild;\n" + source)
+        for host in ("reader-alias.test", "www.reader-alias.test"):
+            with self.subTest(host=host):
+                self.requests.clear()
+                self.page.goto(f"https://{host}/12/2.html")
+                expect(self.page.locator(READER)).to_be_visible()
+                expect(self.page.locator("#__rd_content p")).to_have_count(30)
+                expect(self.page.locator("#__rd_bar .t")).to_have_text("第一章 开端")
+                self.assertGreaterEqual(self.requests.count(f"https://{host}/12/2.html"), 2,
+                                        "新域名仍优先 fetch 服务端正文")
+                self.assertTrue(self.page.evaluate("""() => {
+                    const script = document.createElement('script');
+                    script.src = 'https://blocked.test/j2ggdy9.js';
+                    document.head.appendChild(script);
+                    return !script.isConnected;
+                }"""), "新域名同时启用反劫持")
+        for host in ("not-reader-alias.test", "reader-alias.test.example.org", "unrelated.test"):
+            with self.subTest(host=host):
+                self.page.goto(f"https://{host}/12/2.html")
+                expect(self.page.locator(READER_QUICK)).to_be_visible()
+                expect(self.page.locator(READER)).to_have_count(0)
+                self.assertTrue(self.page.evaluate("Node.prototype.appendChild === window.__originalAppend"),
+                                "无关网站不启用速读谷反劫持")
+                self.page.locator(READER_QUICK).click()
+                expect(self.page.locator(READER)).to_be_visible()  # 通用阅读仍然可用。
 
     def test_nsfw_hanxiucao_module_registers_a_dock_entry_only_on_play_pages(self):
         self.load(("ads",))

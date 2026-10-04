@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阅读模式 Pro（通用正文提取 · 连续翻页 · 进度记忆）
 // @namespace    https://github.com/yourname/reader-mode
-// @version      3.0.0
+// @version      3.1.0
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @description  任意小说 / 文章网页一键进入阅读模式：自动识别正文并去除干扰，自动加载下一页 / 下一章，按段落记忆阅读进度，按网站记住开关、下次自动进入。内置速读谷反劫持与 hl365 去弹窗规则；与隐藏干扰项、视频嗅探共用悬浮球。
@@ -17,49 +17,105 @@
 
   if (window.top !== window.self) return;
 
-  const VERSION = '3.0.0';
+  const VERSION = '3.1.0';
 
   /* ==================================================================
-   * 第一部分：站点专属净化。反劫持必须在 document-start 抢先执行。
-   * 通用阅读模式不依赖这里；只是速读谷 / hl365 这两个站需要额外处理。
+   * ★ 用户配置区：换域名 / 加新站，只改下面这一个 SITES 列表就行。★
+   * ------------------------------------------------------------------
+   * 每个 { } 是一个网站的配置；想加新站，复制一段、改域名和选择器即可。
+   * 域名写法：根域名 'suduguu.com'（自动含 www、m 等子域）；也可直接粘贴
+   *   完整网址 'https://suduguu.com/12/2.html'（路径会被忽略）。旧域名可
+   *   保留，多写几个没关系；写错的那一项会被自动忽略，不连累其它站。
+   * 每项加英文引号、末尾加英文逗号；保存后替换手机里的脚本并刷新网页。
+   * 只有 domains 必填；其余字段都可省略，省略就走通用阅读模式。
+   * ------------------------------------------------------------------
+   * 字段说明：
+   *   domains         该站的域名 / 网址列表（必填）
+   *   content         正文容器选择器         title  章节标题选择器
+   *   nav             翻页链接所在容器
+   *   preferFetch     先抓服务端原文再解析（对付把正文掺假的站）
+   *   autoPath        只有匹配的地址才自动进入
+   *   autoDefault     没手动设置过时是否默认自动进入
+   *   catalogFromPath 由章节地址推出目录地址
+   *   antiHijack      反劫持：拦截注入的已知广告脚本（配合 badScripts）
+   *   blockPopups     反劫持：封杀自动弹窗 / 跳转（换域名也有效，推荐开）
+   *   badScripts      已知劫持脚本的特征正则；换域名后冒出新脚本时，把它
+   *                   网址里的特征词加进来即可
+   *   hideAds         要隐藏的广告元素选择器数组
+   *   killPopups      要直接移除并恢复滚动的弹窗选择器数组
+   * 换域名通常只需改 domains；页面结构也变了才需要动 content / nav 等。
    * ================================================================== */
+  const SITES = [
+    {
+      name: '速读谷',
+      domains: [
+        'sudugu.org',
+        'suduguu.com',
+        // 'new-domain.example',          // ← 下次换域名时，在这里加一行
+      ],
+      content: '.con', title: '.submenu h1', nav: '.prenext',
+      preferFetch: true, autoPath: /\/\d+\/\d+(-\d+)?\.html$/, autoDefault: true, catalogFromPath: true,
+      antiHijack: true, blockPopups: true,
+      badScripts: /(j2ggdy9|bzau8uk|openjson\d*|jigool|fkt5bpu|06uww3s|2l5xeuu|authlight)/i,
+    },
+    {
+      name: 'hl365',
+      domains: ['hl365.com'],
+      hideAds: ['.adspop', '.application-popup', '.article-ads-btn', '.btn-download',
+        '.horizontal-banner', '.ads-title', '.article-bottom-apps', '[id^="article-bottom-ads-"]'],
+      killPopups: ['.adspop', '.application-popup'],
+    },
+    // { name: '新站点', domains: ['example.com'], content: '#content' },   // ← 复制这行加新站
+  ];
 
-  /* ------------------------------------------------------------------
-   * 网站适配配置：以后网址换域名时，只改下面两个数组即可。
-   * 支持裸域名和子域名，例如 'suduguu.com' 同时匹配 www.suduguu.com。
-   * 不要带 http(s)://，不要带路径。
-   * ------------------------------------------------------------------ */
-  const SU_DOMAINS = ['sudugu.org', 'suduguu.com'];   // 速读谷：正文规则 + 反劫持
-  const HL365_DOMAINS = ['hl365.com'];                // hl365：去弹窗规则
+  function normalizeDomain(raw) {
+    if (typeof raw !== 'string') return '';
+    const value = raw.trim();
+    if (!value || /[\s\\]/.test(value)) return '';
+    try {
+      const url = new URL(/^[a-z][a-z\d+.-]*:/i.test(value) ? value :
+        (value.startsWith('//') ? 'https:' : 'https://') + value);
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password) return '';
+      const domain = url.hostname.toLowerCase().replace(/\.$/, '');
+      // 不接受通配符、空标签等无效域名，避免把配置错误扩大为跨站匹配。
+      return /^(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z\d](?:[a-z\d-]*[a-z\d])?$/.test(domain) ? domain : '';
+    } catch (e) { return ''; }
+  }
 
   function hostMatches(domains) {
-    const host = (location.hostname || '').toLowerCase();
+    const host = (location.hostname || '').toLowerCase().replace(/\.$/, '');
     return domains.some((raw) => {
-      const domain = String(raw).trim().toLowerCase().replace(/^\.+/, '');
+      const domain = normalizeDomain(raw);
       return !!domain && (host === domain || host.endsWith('.' + domain));
     });
   }
 
-  const BAD = /(j2ggdy9|bzau8uk|openjson\d*|jigool|fkt5bpu|06uww3s|2l5xeuu|authlight)/i;
-  const IS_SUDUGU = hostMatches(SU_DOMAINS);
-  const IS_HL365 = hostMatches(HL365_DOMAINS);
+  // 当前网站命中的配置；没命中就是空对象 —— 通用阅读模式照常可用。
+  const site = SITES.find((s) => Array.isArray(s.domains) && hostMatches(s.domains)) || {};
   let blocked = 0;
 
-  function isBadScriptNode(node) {
-    if (!IS_SUDUGU || !node || node.nodeType !== 1 || node.tagName !== 'SCRIPT') return false;
-    const src = node.src || (node.getAttribute && node.getAttribute('src')) || '';
-    if (!src) return false;
-    return BAD.test(src);
-  }
-  function wrapInsert(orig) {
-    return function (node) {
-      try {
-        if (isBadScriptNode(node)) { blocked++; return node; } // 假装成功，实际不入 DOM
-      } catch (e) {}
-      return orig.apply(this, arguments);
-    };
-  }
-  if (IS_SUDUGU) {
+  /* ==================================================================
+   * 第一部分：站点专属净化。反劫持必须在 document-start 抢先执行。
+   * 每一块都单独包进 try：任何一步出错都不连累悬浮球和通用阅读模式。
+   * 通用阅读模式不依赖这里，只有速读谷 / hl365 这类站需要额外处理。
+   * ================================================================== */
+
+  // 反劫持：拦掉已知的注入广告脚本 + 透明诱饵层 + 作恶 WebSocket。
+  function installAntiHijack() {
+    const bad = site.badScripts;
+    function isBadScriptNode(node) {
+      if (!bad || !node || node.nodeType !== 1 || node.tagName !== 'SCRIPT') return false;
+      const src = node.src || (node.getAttribute && node.getAttribute('src')) || '';
+      return !!src && bad.test(src);
+    }
+    function wrapInsert(orig) {
+      return function (node) {
+        try {
+          if (isBadScriptNode(node)) { blocked++; return node; } // 假装成功，实际不入 DOM
+        } catch (e) {}
+        return orig.apply(this, arguments);
+      };
+    }
     Node.prototype.insertBefore = wrapInsert(Node.prototype.insertBefore);
     Node.prototype.appendChild = wrapInsert(Node.prototype.appendChild);
 
@@ -75,7 +131,7 @@
     const _WS = window.WebSocket;
     if (_WS) {
       const FakeWS = function (url) {
-        if (BAD.test(String(url)) || /:2009\d(\b|\/)/.test(String(url))) {
+        if ((bad && bad.test(String(url))) || /:2009\d(\b|\/)/.test(String(url))) {
           blocked++;
           return { close() {}, send() {}, addEventListener() {}, removeEventListener() {},
             readyState: 3, set onopen(v) {}, set onmessage(v) {}, set onclose(v) {}, set onerror(v) {} };
@@ -88,20 +144,32 @@
     }
   }
 
-  const HL365_AD_SELECTORS = [
-    '.adspop', '.application-popup', '.article-ads-btn', '.btn-download',
-    '.horizontal-banner', '.ads-title', '.article-bottom-apps', '[id^="article-bottom-ads-"]',
-  ].join(',\n');
+  // 行为型防护：广告脚本常靠 window.open 弹窗 / 跳第三方。直接封杀它，
+  // 不依赖脚本名，换域名后依然有效。阅读器翻页走 location.href，不受影响。
+  function installPopupBlocker() {
+    const _open = window.open;
+    const fake = function () { blocked++; return null; };
+    try { fake.toString = () => (_open ? Function.prototype.toString.call(_open) : 'function open() { [native code] }'); } catch (e) {}
+    try { window.open = fake; } catch (e) {}
+  }
 
-  function installHl365Blocker() {
+  if (site.antiHijack) { try { installAntiHijack(); } catch (e) {} }
+  if (site.blockPopups) { try { installPopupBlocker(); } catch (e) {} }
+
+  // 去广告 / 关弹窗（hl365 这类站）：隐藏广告元素、移除弹窗并恢复滚动。
+  function installAdHider() {
+    const hideList = Array.isArray(site.hideAds) ? site.hideAds : [];
+    const killList = Array.isArray(site.killPopups) ? site.killPopups : [];
+    const killSelector = killList.join(',');
     const style = document.createElement('style');
-    style.id = '__rd_hl365_ad_style';
-    style.textContent = `${HL365_AD_SELECTORS}{display:none!important;}`;
+    style.id = '__rd_site_ad_style';
+    if (hideList.length) style.textContent = `${hideList.join(',\n')}{display:none!important;}`;
     function ensureStyle() {
-      if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
+      if (hideList.length && !style.isConnected) (document.head || document.documentElement).appendChild(style);
     }
     function removePopups() {
-      const popups = document.querySelectorAll('.adspop,.application-popup');
+      if (!killSelector) return;
+      const popups = document.querySelectorAll(killSelector);
       if (!popups.length) return;
       popups.forEach((popup) => popup.remove());
       if (document.body) document.body.style.removeProperty('overflow');
@@ -110,19 +178,21 @@
     ensureStyle();
     new MutationObserver((records) => {
       ensureStyle();
+      if (!killSelector) return;
       const addedPopup = records.some((record) => Array.from(record.addedNodes).some((node) =>
-        node.nodeType === 1 &&
-        (node.matches('.adspop,.application-popup') || node.querySelector('.adspop,.application-popup'))));
+        node.nodeType === 1 && (node.matches(killSelector) || node.querySelector(killSelector))));
       if (addedPopup) removePopups();
     }).observe(document.documentElement, { childList: true, subtree: true });
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', removePopups, { once: true });
     else removePopups();
   }
-  if (IS_HL365) installHl365Blocker();
+  if ((site.hideAds && site.hideAds.length) || (site.killPopups && site.killPopups.length)) {
+    try { installAdHider(); } catch (e) {}
+  }
 
   // 速读谷：清扫已漏网的透明诱饵层 / 撑高 body 的 style
   function sweepDecoys() {
-    if (!IS_SUDUGU) return;
+    if (!site.antiHijack) return;
     try {
       document.querySelectorAll('div[style*="opacity:0.01"],div[style*="opacity: 0.01"]').forEach((d) => d.remove());
       document.querySelectorAll('style').forEach((s) => {
@@ -131,17 +201,6 @@
       });
     } catch (e) {}
   }
-
-  /* 站点规则：只提供"提示"，不是必需。没有规则的网站走通用识别。
-   *   domains     匹配顶部配置里的域名数组       content  正文容器选择器
-   *   title      章节标题选择器                 nav     翻页链接所在容器
-   *   preferFetch 先 fetch 服务端原文再解析（对付把正文异步掺假填充的站）
-   *   autoPath    只有匹配的地址才自动进入   autoDefault 没手动设置过时是否默认自动进入 */
-  const SITE_RULES = [
-    { domains: SU_DOMAINS, content: '.con', title: '.submenu h1', nav: '.prenext',
-      preferFetch: true, autoPath: /\/\d+\/\d+(-\d+)?\.html$/, autoDefault: true, catalogFromPath: true },
-  ];
-  const site = SITE_RULES.find((rule) => rule.domains && hostMatches(rule.domains)) || {};
 
   // BEGIN shared safari tools dock
   // 两个可独立安装的脚本内嵌同一入口；只通过 DOM 注册功能，不依赖共享 JS 全局变量。
