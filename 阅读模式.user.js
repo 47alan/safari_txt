@@ -2,6 +2,8 @@
 // @name         阅读模式 Pro（通用正文提取 · 连续翻页 · 进度记忆）
 // @namespace    https://github.com/yourname/reader-mode
 // @version      3.0.0
+// @updateURL    https://raw.githubusercontent.com/47alan/safari_txt/main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
+// @downloadURL  https://raw.githubusercontent.com/47alan/safari_txt/main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @description  任意小说 / 文章网页一键进入阅读模式：自动识别正文并去除干扰，自动加载下一页 / 下一章，按段落记忆阅读进度，按网站记住开关、下次自动进入。内置速读谷反劫持与 hl365 去弹窗规则；与隐藏干扰项、视频嗅探共用悬浮球。
 // @author       you
 // @match        *://*/*
