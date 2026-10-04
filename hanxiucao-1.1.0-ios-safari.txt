@@ -1,0 +1,1255 @@
+// ==UserScript==
+// @name         含羞草
+// @namespace    hxc-pure-reverse
+// @version      1.1.6
+// @description  iOS Safari 适配：同域 getPreUrl + start/end 扩窗。修复 iPhone/iPad 上「电脑能用、iOS 没反应、连面板都不出现」；全站注入 + 内部判断，静音自动播兜底，置顶诊断条。
+// @author       reverse
+// @match        *://*/*
+// @include      *
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+/**
+ * v1.1.6 稳定性修复（针对「时好时坏、刷新几次才行」）
+ * - 关键 bug：补回缺失的 const DEBUG。之前 DEBUG 未声明，'use strict' 下 showDiag
+ *   一进门就抛 ReferenceError；而 fetchPreUrlById 每个取址组合都是「先 showDiag 再取址」，
+ *   异常被 catch 吞掉 → fetchPreUrlOnce 从没执行 → fallback 取址永远失败，只能靠 hook
+ *   偶尔命中才播得出来。这正是「时好时坏」的主因。
+ * - 取址请求现在有 8s 超时：以前 postApi 的 fetch 无超时，iOS 上偶尔挂住不返回，
+ *   面板就一直停在「取址中…」，只能刷新。
+ * - 取址对「网络/超时」类瞬时错误做指数退避重试（500/1200/1900ms），
+ *   服务端已返回的逻辑失败（如试看关闭）不重试、直接换下一个 base，避免拖慢。
+ * - 修掉 hook 与 fallback 两条路并发各挂一次播放器导致的反复重建（onGotVideoUrl 加锁）。
+ * - 重挂循环加「上一拍没跑完就跳过」，避免每 400ms 叠加异步 attach、建出多个 hls 实例。
+ * - cloneInflight 在请求返回后重置，避免页面内后续合法触发被静默挡掉。
+ *
+ * v1.1.5：游客身份取址已验证可播。默认关闭顶部诊断条（DEBUG=false，不挡视线）；
+ * 以后要排障把顶部的 const DEBUG 改成 true 即可恢复状态条。
+ *
+ * v1.1.4 修复点（诊断条 auth=yes、多档 videoSort 全部「试看功能已关闭」）
+ * - 关键反转：桌面是纯游客能看，iOS 带了登录 token（auth=yes）反而被判「已注册→开通VIP」。
+ *   试看多半只对游客开放。取址改为「游客身份(去掉 Auth) 优先」逐个组合尝试。
+ * - 组合顺序：guest×{URL sort, 不带, 1, 0} → auth×{URL sort, 不带}，诊断条显示 sort=X guest/auth。
+ * - 全部失败时诊断条给出「游客/登录多组合均失败: …」，便于判断是否要换 hook 复用 body 的思路。
+ *
+ * v1.1.3 修复点（诊断条已出现、但服务端返回「视频试看功能已关闭」）
+ * - 取址代码与桌面版完全一致；桌面靠 hook 复用页面请求成功，iOS 的 hook 多半失效 →
+ *   走 fallback 自拼 body，而 videoSort 写死 1 常和 /play/video/{id}/{sort} 对不上。
+ * - fallback 改为按「URL 里的 sort → 1 → 0 → 2 → 3」自动多值尝试 getPreUrl。
+ * - 诊断条新增 auth=yes/NO，用于判断 iOS 是否带上了登录 token（未登录时试看常被关）。
+ *
+ * v1.1.2 修复点（iPhone/iPad 上「电脑能用、iOS 没反应、连面板都不出现」）
+ * - 关键：不再用 isIosSafari 当「是否运行」的开关。iOS 脚本管理器、以及 iPhone/iPad
+ *   的「请求桌面网站」会让检测误判 false，导致脚本整个不激活；现在检测只用于开启
+ *   iOS 专属样式。
+ * - @match 放宽为全站注入，改用脚本内部 location.href 判断是否播放页，规避 Safari
+ *   扩展对 @match/@include 的挑剔，以及 SPA（从首页点进片子、URL 不整页刷新）不注入。
+ * - 新增无条件「诊断条」：只要脚本在播放页激活，就置顶显示 UA/URL/状态，方便定位
+ *   到底是「没注入」还是「取址/播放失败」。
+ * - installNetworkHooks 幂等，SPA 跳进播放页时补装；MutationObserver 只在播放页启动，
+ *   不打扰其它网站。
+ *
+ * v1.1.1 修复点（iOS Safari）
+ * - iPad「请求桌面网站」时 UA 无 Mobile，旧检测把 iPad 整个排除 → 脚本不运行，现已放行
+ * - 页内不播的核心：iOS 禁止有声自动播放；改为「先静音自动播 → 提示点一下开声音」
+ * - 切集/切路由后旧的重试 setInterval / 8s setTimeout 未清除 → 会把上一集地址挂到新页，现已清理
+ * - setTimeout(forcePlay,300) 会把 timeoutId 当参数传入，配合新签名会误判用户手势，已修
+ * - MutationObserver 用 rAF 合并，降低 iOS 高频 DOM 变动的卡顿
+ * - ensureMobileViewport 不再覆盖站点已有 viewport
+ *
+ * v1.1 修复点（针对「打开 m3u8 可以，页内半天打不开」）
+ * - 实测：地址与 CDN 正常，问题在页内播放链路
+ * - ckplayer 会加载 hls，但自动播放常被浏览器策略拦成 paused（readyState 已够）
+ * - MutationObserver 误删封面/容器会和 Vue 互撕，导致播放器反复重建
+ * - 原先等 2.5s 才兜底，体感「半天没反应」
+ * - master m3u8 多一层，部分线路慢；先解析到 media m3u8 再喂播放器
+ *
+ * 策略：
+ * 1. hook 同域 getInfo → 并行 getPreUrl（复用加密 body）
+ * 2. 立即主动 fallback，不傻等
+ * 3. 扩窗 start=0&end=999999（删参数会 404）
+ * 4. 优先自建 video + 站点 hls.min.js，失败再 ckplayer
+ * 5. 自动播放失败显示「点击播放」大按钮
+ */
+
+(function () {
+  'use strict';
+
+  // 顶部诊断条开关：排障时改成 true 就会置顶显示 UA/URL/状态。
+  // （之前漏了这行声明，'use strict' 下 showDiag 里的 !DEBUG 会抛 ReferenceError，
+  //  把 fetchPreUrlById 每个取址组合都提前打断 → fallback 永远失败、只能靠 hook。）
+  const DEBUG = false;
+
+  const AES_KEY = 'B77A9FF7F323B5404902102257503C2F';
+  const END_EXPAND = 999999;
+  const TAG = '[hxc-unlock]';
+  const IS_IOS_SAFARI = isIosSafari();
+  // 站点 ckplayer 自带的 hls（同源业务静态资源，非第三方破解 API）
+  const SITE_HLS_CANDIDATES = [
+    () => {
+      try {
+        const ck = document.querySelector('script[src*="ckplayer"]');
+        if (ck && ck.src) {
+          const base = ck.src.replace(/\/js\/ckplayer[^/]*$/, '/');
+          return base + 'hls.js/hls.min.js';
+        }
+      } catch {
+        /* ignore */
+      }
+      return null;
+    },
+    () => {
+      const host = location.hostname;
+      // 页面静态资源常见在 j0x.nasuiyile.com，从已加载脚本推断
+      const hit = [...document.scripts]
+        .map((s) => s.src)
+        .find((s) => /nasuiyile\.com|ckplayer/i.test(s));
+      if (hit) {
+        try {
+          const u = new URL(hit);
+          return [
+            u.origin + '/h5/ckplayer/hls.js/hls.min.js',
+            u.origin + '/mobile/ckplayer/hls.js/hls.min.js',
+            u.origin + '/pc/ckplayer/hls.js/hls.min.js',
+          ];
+        } catch {
+          /* ignore */
+        }
+      }
+      return null;
+    },
+    () => [
+      'https://j02n.nasuiyile.com/h5/ckplayer/hls.js/hls.min.js',
+      'https://j02n.nasuiyile.com/mobile/ckplayer/hls.js/hls.min.js',
+      'https://j02n.nasuiyile.com/pc/ckplayer/hls.js/hls.min.js',
+    ],
+  ];
+
+  const BUILTIN_API_CANDIDATES = [
+    'https://a64d.vd9h4.com',
+    'https://a59e.f3de7.com',
+  ];
+
+  const STATE = {
+    apiBase: '',
+    videoUrl: '',
+    mediaUrl: '',
+    videoId: 0,
+    played: false, // 真正开始播/用户可点播
+    attached: false, // 播放器已挂上
+    lastHref: '',
+    unlocking: false,
+    attachTimer: null, // 挂载重试 interval 句柄
+    readyTimer: null, // 8s 未播兜底 timeout 句柄
+    hooksInstalled: false, // 网络 hook 是否已装（幂等）
+    attaching: false, // onGotVideoUrl 正在挂载（hook 与 fallback 并发时的互斥锁）
+  };
+
+  /* ---------------- utils ---------------- */
+
+  function log(...args) {
+    console.log(TAG, ...args);
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // 带超时的 fetch：iOS Safari 上请求偶尔会挂住不返回，超时后 abort，交给上层重试/换 base。
+  async function fetchWithTimeout(url, opts, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms || 8000);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // 无条件可见的诊断条：只要脚本在播放页激活就置顶显示，方便在 iOS 上判断
+  // 「脚本到底注入了没 / 卡在哪一步」。点右上角 × 可关闭。
+  function showDiag(extra) {
+    if (!DEBUG) return; // 默认关闭，不挡视线；DEBUG=true 时才显示诊断条
+    try {
+      let d = document.getElementById('hxc-diag');
+      if (!d) {
+        d = document.createElement('div');
+        d.id = 'hxc-diag';
+        d.style.cssText =
+          'position:fixed;left:0;right:0;top:0;z-index:2147483647;' +
+          'background:rgba(0,0,0,.86);color:#7CFFB2;font:12px/1.4 monospace;' +
+          'padding:6px 30px 6px 8px;white-space:pre-wrap;word-break:break-all;';
+        const close = document.createElement('span');
+        close.textContent = '×';
+        close.style.cssText =
+          'position:absolute;right:8px;top:2px;color:#fff;font-size:20px;line-height:1;cursor:pointer;';
+        close.onclick = () => d.remove();
+        const body = document.createElement('div');
+        body.id = 'hxc-diag-body';
+        d.appendChild(close);
+        d.appendChild(body);
+        (document.body || document.documentElement).appendChild(d);
+      }
+      const b = d.querySelector('#hxc-diag-body') || d;
+      b.textContent =
+        'hxc v1.1.6 · iosSafari=' +
+        IS_IOS_SAFARI +
+        ' · isPlayPage=' +
+        /\/play\/video\//i.test(location.href) +
+        ' · auth=' +
+        (hasAuthToken() ? 'yes' : 'NO') +
+        (extra ? ' · ' + extra : '') +
+        '\n' +
+        location.href;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function isIosSafari() {
+    const ua = navigator.userAgent || '';
+    // iPadOS 13+ 默认「请求桌面网站」，UA 变成 Macintosh，无 iPad/Mobile 字样，
+    // 只能靠 MacIntel + 多点触控识别，否则 iPad 上脚本会整个不运行。
+    const iPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+    const isIOS = /iPad|iPhone|iPod/i.test(ua) || iPadOS;
+    if (!isIOS) return false;
+    // 明确的第三方 iOS 浏览器才排除；桌面模式的 Safari UA 不含 Mobile，
+    // 不能再拿 Mobile 当放行条件（否则 iPad 桌面模式被误杀）。
+    const isOtherIOSBrowser = /CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo|YaBrowser|MicroMessenger|QQBrowser|UCBrowser|Quark/i.test(ua);
+    return !isOtherIOSBrowser;
+  }
+
+  function isApiPath(url, path) {
+    return typeof url === 'string' && url.indexOf(path) !== -1;
+  }
+
+  function rememberApiBase(url) {
+    if (!url || !/^https?:\/\//i.test(url)) return;
+    try {
+      const u = new URL(url, location.href);
+      if (/\/(videos|base|gather|login|user|vip|visitor)\//.test(u.pathname)) {
+        STATE.apiBase = u.origin;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function expandTrialUrl(url) {
+    if (!url) return '';
+    let u = String(url).replace(/\\u0026/g, '&');
+    if (/[?&]start=\d+/i.test(u)) u = u.replace(/([?&])start=\d+/gi, '$1start=0');
+    else u += (u.indexOf('?') >= 0 ? '&' : '?') + 'start=0';
+    if (/[?&]end=\d+/i.test(u)) u = u.replace(/([?&])end=\d+/gi, '$1end=' + END_EXPAND);
+    else u += '&end=' + END_EXPAND;
+    return u.replace(/&&/g, '&').replace(/\?&/, '?');
+  }
+
+  function resetTrialCounters() {
+    try {
+      const pre = localStorage.getItem('preInfo');
+      if (pre) {
+        const o = JSON.parse(pre);
+        o.count = 0;
+        o.preNum = 0;
+        localStorage.setItem('preInfo', JSON.stringify(o));
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const t = localStorage.getItem('tryPlayNum');
+      if (t) {
+        const o = JSON.parse(t);
+        o.num = 0;
+        localStorage.setItem('tryPlayNum', JSON.stringify(o));
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function parseVideoIdFromLocation(href) {
+    const url = href || location.href;
+    const m2 = url.match(/[?&]videoId=(\d+)/i);
+    if (m2) return parseInt(m2[1], 10);
+    const m = url.match(/\/play\/video\/(\d+)(?:[/?#]|$)/i);
+    if (m) return parseInt(m[1], 10);
+    return 0;
+  }
+
+  function isGatherOnlyUrl(href) {
+    const url = href || location.href;
+    return /\/play\/video\/\d+\/1(?:[?#]|$)/i.test(url) && !/[?&]videoId=/i.test(url);
+  }
+
+  function parseGatherId(href) {
+    const url = href || location.href;
+    let m = url.match(/[?&]cid=(\d+)/i);
+    if (m) return parseInt(m[1], 10);
+    m = url.match(/\/play\/video\/(\d+)\/1(?:[?#]|$)/i);
+    if (m) return parseInt(m[1], 10);
+    return 0;
+  }
+
+  // 从 URL 解析 videoSort（集序）。桌面版靠 hook 复用页面 body 自带正确的 videoSort，
+  // iOS 走 fallback 得自己拼，写死 1 会和 /play/video/{id}/{sort} 里的 sort 对不上。
+  function parseVideoSortFromLocation(href) {
+    const url = href || location.href;
+    let m = url.match(/[?&]videoSort=(\d+)/i);
+    if (m) return parseInt(m[1], 10);
+    m = url.match(/\/play\/video\/\d+\/(\d+)(?:[/?#]|$)/i);
+    if (m) return parseInt(m[1], 10);
+    return -1; // 未知
+  }
+
+  // 判断当前是否带得出登录 token（诊断条据此显示 auth=yes/NO）。
+  function hasAuthToken() {
+    try {
+      const stores = [localStorage, sessionStorage];
+      for (let s = 0; s < stores.length; s++) {
+        const store = stores[s];
+        if (!store) continue;
+        const keys = Object.keys(store);
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          if (/token|auth/i.test(k)) {
+            const v = store.getItem(k);
+            if (v && v.length < 500 && v[0] !== '{') return true;
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+
+  /* ---------------- AES ---------------- */
+
+  function bytesToBase64(bytes) {
+    let s = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(s);
+  }
+
+  async function aesEncrypt(plain) {
+    const keyBytes = new TextEncoder().encode(AES_KEY);
+    const iv = keyBytes.slice(0, 16);
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'AES-CBC' },
+      false,
+      ['encrypt']
+    );
+    const cipher = await crypto.subtle.encrypt(
+      { name: 'AES-CBC', iv },
+      cryptoKey,
+      new TextEncoder().encode(String(plain))
+    );
+    return bytesToBase64(new Uint8Array(cipher));
+  }
+
+  function utcTs() {
+    const z = new Date();
+    return parseInt(z.getTime() / 1e3, 10) + z.getTimezoneOffset() * 60;
+  }
+
+  function compactBody(obj) {
+    const out = {};
+    Object.keys(obj || {}).forEach((k) => {
+      const v = obj[k];
+      if (v === '' || v === null || v === undefined) return;
+      out[k] = v;
+    });
+    return out;
+  }
+
+  async function buildEncryptedPayload(data) {
+    const plain = JSON.stringify(compactBody(data));
+    return {
+      endata: await aesEncrypt(plain),
+      ents: await aesEncrypt(String(utcTs())),
+    };
+  }
+
+  /* ---------------- network ---------------- */
+
+  function defaultHeaders(extra) {
+    const h = {
+      accept: 'application/json, text/plain, */*',
+      'content-type': 'application/json;charset=UTF-8;',
+      Did: '1',
+      source: '1',
+      isShortChain: '',
+    };
+    try {
+      const keys = Object.keys(localStorage);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (/token|auth/i.test(k)) {
+          const v = localStorage.getItem(k);
+          if (v && v.length < 500 && v[0] !== '{') {
+            h.Auth = v.replace(/^"|"$/g, '');
+            break;
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return Object.assign(h, extra || {});
+  }
+
+  function collectApiBases() {
+    const bases = [];
+    const add = (b) => {
+      if (b && bases.indexOf(b) === -1) bases.push(b);
+    };
+    add(STATE.apiBase);
+    BUILTIN_API_CANDIDATES.forEach(add);
+    try {
+      performance.getEntriesByType('resource').forEach((e) => {
+        if (/\/videos\/|\/base\//.test(e.name)) add(new URL(e.name).origin);
+      });
+    } catch {
+      /* ignore */
+    }
+    return bases;
+  }
+
+  const API_TIMEOUT = 8000;
+  const API_RETRY_DELAYS = [500, 1200, 1900]; // 瞬时错误的指数退避重试间隔
+
+  async function postApi(path, data, headers) {
+    const bases = collectApiBases();
+    let lastErr = null;
+    for (let i = 0; i < bases.length; i++) {
+      const base = bases[i];
+      // 每个 base 上对「网络/超时」类瞬时错误做指数退避重试；
+      // 服务端已返回但逻辑失败（如试看关闭）不重试，直接换下一个 base。
+      for (let attempt = 0; attempt <= API_RETRY_DELAYS.length; attempt++) {
+        try {
+          const payload = await buildEncryptedPayload(data);
+          const res = await fetchWithTimeout(
+            base + path,
+            {
+              method: 'POST',
+              headers: headers || defaultHeaders(),
+              body: JSON.stringify(payload),
+              credentials: 'omit',
+            },
+            API_TIMEOUT
+          );
+          const json = await res.json();
+          if (json && (json.code === 0 || json.data)) {
+            STATE.apiBase = base;
+            return json;
+          }
+          lastErr = json;
+          break; // 逻辑失败，重试也没用，换下一个 base
+        } catch (e) {
+          lastErr = e; // 网络/超时/abort 类瞬时错误：退避后重试
+          if (attempt < API_RETRY_DELAYS.length) await sleep(API_RETRY_DELAYS[attempt]);
+        }
+      }
+    }
+    throw lastErr || new Error('all api bases failed');
+  }
+
+  async function fetchPreUrlOnce(videoId, videoSort, noAuth) {
+    const id = Number(videoId);
+    if (!id) throw new Error('invalid videoId');
+    const body = { videoId: id };
+    if (videoSort != null && Number(videoSort) >= 0) body.videoSort = Number(videoSort);
+    const headers = defaultHeaders();
+    // 关键：该站「试看」多半只对游客(未登录)开放，带 token 反而被判为「已注册→开通VIP」。
+    // noAuth=true 时去掉登录态，复现「桌面游客」那条能成功的请求。
+    if (noAuth && headers.Auth) delete headers.Auth;
+    const json = await postApi('/videos/getPreUrl', body, headers);
+    if (!json || !json.data || !json.data.url) {
+      throw new Error((json && json.msg) || 'getPreUrl empty');
+    }
+    return expandTrialUrl(json.data.url);
+  }
+
+  // 之前发现：多档 videoSort 全部「试看功能已关闭」，而诊断条 auth=yes。
+  // 桌面是纯游客却能看 → 试看只对游客开放。所以这里「游客身份优先」逐个组合尝试。
+  async function fetchPreUrlById(videoId, hintSort) {
+    const combos = [];
+    const seen = {};
+    const add = (noAuth, s) => {
+      if (s != null && s < 0) return;
+      const key = (noAuth ? 'g' : 'a') + '|' + (s == null ? 'none' : s);
+      if (seen[key]) return;
+      seen[key] = true;
+      combos.push({ noAuth: noAuth, sort: s });
+    };
+    // 游客(不带 token)优先
+    add(true, hintSort);
+    add(true, null);
+    add(true, 1);
+    add(true, 0);
+    // 再退回带登录态
+    add(false, hintSort);
+    add(false, null);
+
+    let lastErr = null;
+    for (let i = 0; i < combos.length; i++) {
+      const c = combos[i];
+      const tag = (c.sort == null ? 'none' : c.sort) + (c.noAuth ? ' guest' : ' auth');
+      try {
+        showDiag('getPreUrl #' + videoId + ' sort=' + tag + ' …');
+        return await fetchPreUrlOnce(videoId, c.sort, c.noAuth);
+      } catch (e) {
+        lastErr = e;
+        log('getPreUrl', tag, 'fail', e && e.message);
+      }
+    }
+    throw new Error(
+      '游客/登录多组合均失败: ' + (lastErr && lastErr.message ? lastErr.message : 'unknown')
+    );
+  }
+
+  async function resolveGatherFirstVideoId(gatherId) {
+    const json = await postApi('/gather/getDetail', { gatherId: Number(gatherId) });
+    const videos = json && json.data && json.data.info && json.data.info.videos;
+    if (videos && videos.length) return Number(videos[0].id);
+    throw new Error('gather empty');
+  }
+
+  /**
+   * master m3u8 → 实际 media m3u8（并继续扩窗）
+   * 失败则退回 master
+   */
+  async function resolvePlayableM3u8(masterUrl) {
+    const url = expandTrialUrl(masterUrl);
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(url, {
+        signal: ctrl.signal,
+        credentials: 'omit',
+        headers: { Accept: '*/*' },
+      });
+      clearTimeout(timer);
+      if (!res.ok) return url;
+      const text = await res.text();
+      // 已是 media playlist
+      if (/#EXTINF:/i.test(text)) return url;
+      const lines = text.split(/\r?\n/);
+      let media = '';
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line[0] === '#') continue;
+        media = line;
+        break;
+      }
+      if (!media) return url;
+      const abs = new URL(media, url).href;
+      return expandTrialUrl(abs);
+    } catch (e) {
+      log('resolve media m3u8 fail, use master', e);
+      return url;
+    }
+  }
+
+  /* ---------------- hooks ---------------- */
+
+  function installNetworkHooks() {
+    if (STATE.hooksInstalled) return;
+    STATE.hooksInstalled = true;
+    const XHR = XMLHttpRequest.prototype;
+    const rawOpen = XHR.open;
+    const rawSend = XHR.send;
+    const rawSetHeader = XHR.setRequestHeader;
+
+    XHR.open = function (method, url) {
+      this.__hxc = { method, url: String(url), headers: {} };
+      rememberApiBase(String(url));
+      return rawOpen.apply(this, arguments);
+    };
+
+    XHR.setRequestHeader = function (k, v) {
+      if (this.__hxc) this.__hxc.headers[k] = v;
+      return rawSetHeader.apply(this, arguments);
+    };
+
+    XHR.send = function (body) {
+      try {
+        const meta = this.__hxc;
+        if (meta && isApiPath(meta.url, '/videos/getInfo')) {
+          rememberApiBase(meta.url);
+          cloneGetPreUrl(meta.url.replace('/videos/getInfo', '/videos/getPreUrl'), body, meta.headers);
+        }
+      } catch (e) {
+        log('xhr hook err', e);
+      }
+      return rawSend.apply(this, arguments);
+    };
+
+    const rawFetch = window.fetch;
+    if (typeof rawFetch === 'function') {
+      window.fetch = function (input, init) {
+        try {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          rememberApiBase(url);
+          if (isApiPath(url, '/videos/getInfo')) {
+            const headers = {};
+            if (init && init.headers) {
+              if (init.headers.forEach) init.headers.forEach((v, k) => (headers[k] = v));
+              else Object.assign(headers, init.headers);
+            }
+            cloneGetPreUrl(url.replace('/videos/getInfo', '/videos/getPreUrl'), init && init.body, headers);
+          }
+        } catch (e) {
+          log('fetch hook err', e);
+        }
+        return rawFetch.apply(this, arguments);
+      };
+    }
+  }
+
+  let cloneInflight = '';
+  function cloneGetPreUrl(preUrl, body, headers) {
+    const key = String(body || '') + '|' + preUrl;
+    if (cloneInflight === key) return;
+    cloneInflight = key;
+
+    const h = Object.assign({}, headers || {});
+    if (!h['Content-Type'] && !h['content-type']) {
+      h['Content-Type'] = 'application/json;charset=UTF-8;';
+    }
+
+    fetch(preUrl, { method: 'POST', headers: h, body: body, credentials: 'omit' })
+      .then((r) => r.json())
+      .then((json) => {
+        if (json && json.data && json.data.url) {
+          log('hook getPreUrl ok');
+          onGotVideoUrl(expandTrialUrl(json.data.url));
+        } else {
+          log('hook getPreUrl fail', json);
+          fallbackUnlock();
+        }
+      })
+      .catch((e) => {
+        log('hook getPreUrl error', e);
+        fallbackUnlock();
+      })
+      .finally(() => {
+        // 请求已结束，放开这把 in-flight 锁，页面内后续合法触发（切集/重试）不再被静默挡掉
+        if (cloneInflight === key) cloneInflight = '';
+      });
+  }
+
+  /* ---------------- UI / player ---------------- */
+
+  function removeVipUi() {
+    // 只动遮罩，别乱删封面/容器（会和 Vue 互撕导致播放器挂掉）
+    const sels = ['.vip-mask', '.absolute.bg-overlay', '.login-tip-modal', '#login-tip-modal'];
+    sels.forEach((s) => {
+      document.querySelectorAll(s).forEach((el) => {
+        try {
+          el.style.setProperty('display', 'none', 'important');
+          el.style.setProperty('pointer-events', 'none', 'important');
+        } catch {
+          /* ignore */
+        }
+      });
+    });
+  }
+
+  function ensurePanel(url, statusText) {
+    let panel = document.getElementById('hxc-unlock-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'hxc-unlock-panel';
+      panel.style.cssText =
+        'position:relative;z-index:10001;margin:8px 0;padding:10px 12px;' +
+        'background:rgba(0,0,0,.8);color:#7CFFB2;font:13px/1.5 sans-serif;' +
+        'border-radius:6px;word-break:break-all;';
+      const mount =
+        document.querySelector('#v_prism') ||
+        document.querySelector('#video1') ||
+        document.querySelector('h1,h2') ||
+        document.body;
+      if (mount && mount.parentNode) mount.parentNode.insertBefore(panel, mount.nextSibling);
+      else (document.body || document.documentElement).appendChild(panel);
+    }
+    const safe = (url || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    panel.innerHTML =
+      '<div><b>含羞草解锁</b> <span id="hxc-status" style="opacity:.9">' +
+      (statusText || '') +
+      '</span></div>' +
+      '<div style="margin-top:4px">' +
+      '<a id="hxc-unlock-link" href="' +
+      safe +
+      '" target="_blank" style="color:#6ecbff;margin-right:12px">打开 m3u8</a>' +
+      '<a id="hxc-click-play" href="javascript:void(0)" style="color:#ffd76e;margin-right:12px">点击播放</a>' +
+      '<a id="hxc-retry" href="javascript:void(0)" style="color:#ccc">重试</a>' +
+      '</div>' +
+      '<div style="opacity:.75;font-size:12px;margin-top:4px">若画面黑但有控件：点「点击播放」。直链能播说明地址 OK，是页内自动播放被拦或播放器未挂上。</div>';
+
+    const playBtn = panel.querySelector('#hxc-click-play');
+    if (playBtn) {
+      playBtn.onclick = (e) => {
+        e.preventDefault();
+        forcePlay(true);
+      };
+    }
+    const retryBtn = panel.querySelector('#hxc-retry');
+    if (retryBtn) {
+      retryBtn.onclick = (e) => {
+        e.preventDefault();
+        STATE.played = false;
+        STATE.attached = false;
+        STATE.videoUrl = '';
+        STATE.mediaUrl = '';
+        cloneInflight = '';
+        fallbackUnlock(true);
+      };
+    }
+  }
+
+  function setStatus(t) {
+    const el = document.getElementById('hxc-status');
+    if (el) el.textContent = t || '';
+  }
+
+  function ensureMobileViewport() {
+    if (!IS_IOS_SAFARI || !document.head) return;
+    // 站点已有 viewport 就别改写，避免破坏其自身布局；仅在缺失时补一个。
+    if (document.querySelector('meta[name="viewport"]')) return;
+    const meta = document.createElement('meta');
+    meta.name = 'viewport';
+    meta.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
+    document.head.appendChild(meta);
+  }
+
+  function getPlayerBox() {
+    return (
+      document.querySelector('#v_prism') ||
+      document.querySelector('#video1') ||
+      document.querySelector('.ck-video') ||
+      null
+    );
+  }
+
+  function ensureVideoEl() {
+    let video = document.getElementById('hxc-unlock-video');
+    const box = getPlayerBox();
+    if (!box) return null;
+
+    if (!video || !box.contains(video)) {
+      // 清空站点空壳，挂我们的 video（只清播放容器，不动整页）
+      try {
+        box.innerHTML = '';
+      } catch {
+        /* ignore */
+      }
+      video = document.createElement('video');
+      video.id = 'hxc-unlock-video';
+      video.controls = true;
+      video.playsInline = true;
+      video.setAttribute('playsinline', 'true');
+      video.setAttribute('webkit-playsinline', 'true');
+      video.setAttribute('x-webkit-airplay', 'allow');
+      video.preload = 'auto';
+      video.style.cssText =
+        'width:100%;height:100%;min-height:' +
+        (IS_IOS_SAFARI ? '210px' : '240px') +
+        ';max-height:' +
+        (IS_IOS_SAFARI ? '70vh' : '80vh') +
+        ';background:#000;display:block;position:relative;z-index:99999;';
+      box.style.position = box.style.position || 'relative';
+      box.style.zIndex = '99999';
+      if (IS_IOS_SAFARI) {
+        box.style.aspectRatio = box.style.aspectRatio || '16 / 9';
+        box.style.minHeight = box.style.minHeight || '210px';
+        box.style.background = '#000';
+        box.style.overflow = 'hidden';
+      }
+      box.appendChild(video);
+    }
+    return video;
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const existed = [...document.scripts].find((s) => s.src === src);
+      if (existed) {
+        if (typeof Hls !== 'undefined') return resolve();
+        existed.addEventListener('load', () => resolve());
+        existed.addEventListener('error', () => reject(new Error('hls load fail')));
+        setTimeout(() => (typeof Hls !== 'undefined' ? resolve() : reject(new Error('hls timeout'))), 8000);
+        return;
+      }
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('script error ' + src));
+      (document.head || document.documentElement).appendChild(s);
+    });
+  }
+
+  async function ensureHlsLib() {
+    if (typeof Hls !== 'undefined') return true;
+    const tried = {};
+    for (let i = 0; i < SITE_HLS_CANDIDATES.length; i++) {
+      const list = [].concat(SITE_HLS_CANDIDATES[i]() || []);
+      for (let j = 0; j < list.length; j++) {
+        const src = list[j];
+        if (!src || tried[src]) continue;
+        tried[src] = true;
+        try {
+          log('load hls', src);
+          await loadScript(src);
+          if (typeof Hls !== 'undefined') return true;
+        } catch (e) {
+          log('hls candidate fail', src, e);
+        }
+      }
+    }
+    return typeof Hls !== 'undefined';
+  }
+
+  function bindVideoEvents(video) {
+    if (video.__hxcBound) return;
+    video.__hxcBound = true;
+    video.addEventListener('loadedmetadata', () => {
+      setStatus('已加载 ' + Math.round(video.duration || 0) + 's · 尝试播放');
+      forcePlay();
+    });
+    video.addEventListener('playing', () => {
+      STATE.played = true;
+      if (video.muted) {
+        // 静音自动播放已经动起来了，保留提示层让用户点一下开声音
+        setStatus('已静音自动播放 · 点屏幕开启声音');
+        showClickOverlay();
+      } else {
+        setStatus('播放中');
+        hideClickOverlay();
+      }
+    });
+    video.addEventListener('error', () => {
+      setStatus('video error，请点「打开 m3u8」或重试');
+    });
+  }
+
+  function showClickOverlay() {
+    const box = getPlayerBox();
+    if (!box) return;
+    const video = document.getElementById('hxc-unlock-video');
+    const unmute = !!(video && !video.paused && video.muted); // 正在静音播放 → 提示开声音
+    let ov = document.getElementById('hxc-click-overlay');
+    if (!ov) {
+      ov = document.createElement('div');
+      ov.id = 'hxc-click-overlay';
+      ov.style.cssText =
+        'position:absolute;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;' +
+        'cursor:pointer;color:#fff;font:600 18px/1.2 sans-serif;touch-action:manipulation;';
+      ov.innerHTML =
+        '<div id="hxc-ov-btn" style="padding:14px 22px;border-radius:10px;background:#e6a23c;color:#111">▶ 点击播放</div>';
+      ov.onclick = () => forcePlay(true);
+      ov.addEventListener(
+        'touchend',
+        (e) => {
+          e.preventDefault();
+          forcePlay(true);
+        },
+        { passive: false }
+      );
+      const pos = getComputedStyle(box).position;
+      if (!pos || pos === 'static') box.style.position = 'relative';
+      box.appendChild(ov);
+    }
+    const btn = ov.querySelector('#hxc-ov-btn');
+    if (btn) btn.textContent = unmute ? '🔊 点击开启声音' : '▶ 点击播放';
+    // 静音播放时用更淡的遮罩，别把画面盖死
+    ov.style.background = unmute ? 'rgba(0,0,0,.15)' : 'rgba(0,0,0,.45)';
+    ov.style.display = 'flex';
+  }
+
+  function hideClickOverlay() {
+    const ov = document.getElementById('hxc-click-overlay');
+    if (ov) ov.style.display = 'none';
+  }
+
+  function forcePlay(userGesture) {
+    const video =
+      document.getElementById('hxc-unlock-video') ||
+      document.querySelector('#v_prism video, #video1 video, video');
+    if (!video) {
+      if (STATE.mediaUrl || STATE.videoUrl) attachPlayer(STATE.mediaUrl || STATE.videoUrl);
+      return;
+    }
+    removeVipUi();
+    if (userGesture) video.muted = false; // 只有用户手势才能带声音播
+
+    const p = video.play();
+    if (!p || typeof p.then !== 'function') return;
+
+    p.then(() => {
+      STATE.played = true;
+      if (video.muted) {
+        setStatus('已静音自动播放 · 点屏幕开启声音');
+        showClickOverlay();
+      } else {
+        hideClickOverlay();
+        setStatus('播放中');
+      }
+    }).catch((err) => {
+      log('play blocked', err, 'muted=', video.muted, 'gesture=', !!userGesture);
+      if (!userGesture && !video.muted) {
+        // 有声自动播放被 iOS 拦截 → 退回静音自动播放（iOS 通常放行），先让画面动起来
+        video.muted = true;
+        video
+          .play()
+          .then(() => {
+            STATE.played = true;
+            setStatus('已静音自动播放 · 点屏幕开启声音');
+            showClickOverlay();
+          })
+          .catch((e2) => {
+            log('muted autoplay also blocked', e2);
+            setStatus('需手动点击播放（浏览器拦截自动播放）');
+            showClickOverlay();
+          });
+      } else {
+        setStatus('需手动点击播放（浏览器拦截自动播放）');
+        showClickOverlay();
+      }
+    });
+  }
+
+  async function attachPlayer(url) {
+    if (!url) return false;
+    const video = ensureVideoEl();
+    if (!video) {
+      setStatus('等待播放器容器…');
+      return false;
+    }
+    bindVideoEvents(video);
+    removeVipUi();
+
+    // Safari 原生 HLS
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      if (video.src !== url) video.src = url;
+      try {
+        video.load();
+      } catch {
+        /* ignore */
+      }
+      STATE.attached = true;
+      forcePlay();
+      return true;
+    }
+
+    const ok = await ensureHlsLib();
+    if (!ok || typeof Hls === 'undefined' || !Hls.isSupported()) {
+      setStatus('无 HLS 能力，请点「打开 m3u8」');
+      return false;
+    }
+
+    try {
+      if (video.__hls) {
+        try {
+          video.__hls.destroy();
+        } catch {
+          /* ignore */
+        }
+        video.__hls = null;
+      }
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        log('hls error', data);
+        if (data && data.fatal) {
+          setStatus('HLS 错误: ' + (data.details || data.type));
+          try {
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setStatus('清单已解析，尝试播放');
+        forcePlay();
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      video.__hls = hls;
+      STATE.attached = true;
+      // 再兜一次 play（用箭头包一层，否则 timeoutId 会被当成 userGesture 传进去）
+      setTimeout(() => forcePlay(), 300);
+      return true;
+    } catch (e) {
+      log('attach hls fail', e);
+      setStatus('挂载失败: ' + e.message);
+      return false;
+    }
+  }
+
+  /** 次选：站点 ckplayer（有时比自建慢/被 paused） */
+  function playWithCkplayer(url) {
+    const box = getPlayerBox();
+    if (!box || typeof ckplayer !== 'function') return false;
+    try {
+      if (window.ck) {
+        try {
+          if (typeof window.ck.remove === 'function') window.ck.remove();
+        } catch {
+          /* ignore */
+        }
+        window.ck = null;
+      }
+      // 若我们已有 video，不再用 ckplayer 覆盖
+      if (document.getElementById('hxc-unlock-video')) return false;
+      box.style.zIndex = '99999';
+      window.ck = new ckplayer({
+        container: box.id ? '#' + box.id : box,
+        plug: 'hls.js',
+        video: url,
+        cookie: 'hxc_unlock',
+      });
+      try {
+        window.ck.volume(1);
+        window.ck.play();
+      } catch {
+        /* ignore */
+      }
+      STATE.attached = true;
+      setTimeout(() => {
+        const v = box.querySelector('video');
+        if (v) {
+          v.controls = true;
+          bindVideoEvents(v);
+          forcePlay();
+        }
+      }, 500);
+      return true;
+    } catch (e) {
+      log('ckplayer fail', e);
+      return false;
+    }
+  }
+
+  async function onGotVideoUrl(masterUrl) {
+    if (!masterUrl) return;
+    if (STATE.videoUrl === masterUrl && (STATE.attached || STATE.played)) return;
+    // hook 与 fallback 两条路可能几乎同时拿到地址，各挂一次会让播放器反复重建。
+    // 谁先进来谁负责本轮挂载，另一条直接返回。
+    if (STATE.attaching) return;
+    STATE.attaching = true;
+
+    STATE.videoUrl = masterUrl;
+    ensurePanel(masterUrl, '解析 media 清单…');
+    removeVipUi();
+
+    const mediaUrl = await resolvePlayableM3u8(masterUrl);
+    STATE.mediaUrl = mediaUrl;
+    ensurePanel(mediaUrl, '挂载播放器…');
+    log('play url', mediaUrl.slice(0, 140));
+
+    // 优先自建 HLS（可控、可点播）。inFlight 保证「上一拍没跑完就跳过这一拍」，
+    // 否则每 400ms 叠加一个异步 attach，可能建出多个 hls 实例互相打架。
+    let n = 0;
+    let inFlight = false;
+    const tryAttach = async () => {
+      if (inFlight) return false;
+      inFlight = true;
+      try {
+        removeVipUi();
+        if (await attachPlayer(mediaUrl)) return true;
+        if (playWithCkplayer(mediaUrl)) return true;
+        return false;
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    // 挂载前先清掉上一轮可能还在跑的定时器，避免切集/重试后旧循环把上一集地址挂过来
+    if (STATE.attachTimer) clearInterval(STATE.attachTimer);
+    if (STATE.readyTimer) clearTimeout(STATE.readyTimer);
+    STATE.attachTimer = null;
+    STATE.readyTimer = null;
+
+    STATE.attaching = false; // 定时器接管后即释放锁，切集/重试可再进入
+
+    if (await tryAttach()) return;
+
+    STATE.attachTimer = setInterval(async () => {
+      n++;
+      if ((await tryAttach()) || n > 30) {
+        clearInterval(STATE.attachTimer);
+        STATE.attachTimer = null;
+      }
+    }, 400);
+
+    // 8s 仍无 playing → 提示点播
+    STATE.readyTimer = setTimeout(() => {
+      STATE.readyTimer = null;
+      if (!STATE.played) {
+        setStatus('已就绪但未自动播，请点「点击播放」');
+        showClickOverlay();
+      }
+    }, 8000);
+  }
+
+  /* ---------------- fallback unlock ---------------- */
+
+  async function fallbackUnlock(force) {
+    if (!/\/play\/video\//i.test(location.href)) return;
+    if (STATE.unlocking) return;
+    if (!force && STATE.played) return;
+    if (!force && STATE.videoUrl && STATE.attached) return;
+
+    STATE.unlocking = true;
+    try {
+      resetTrialCounters();
+      ensurePanel(STATE.videoUrl || '#', '取址中…');
+
+      let videoId = parseVideoIdFromLocation();
+      if (isGatherOnlyUrl()) {
+        const gid = parseGatherId();
+        if (gid) {
+          setStatus('解析合集…');
+          videoId = await resolveGatherFirstVideoId(gid);
+        }
+      }
+      if (!videoId) {
+        setStatus('未识别 videoId');
+        return;
+      }
+      STATE.videoId = videoId;
+      log('fallback videoId', videoId);
+      const hintSort = parseVideoSortFromLocation();
+      setStatus('getPreUrl #' + videoId);
+      const url = await fetchPreUrlById(videoId, hintSort);
+      await onGotVideoUrl(url);
+    } catch (e) {
+      log('fallback fail', e);
+      const msg = '失败: ' + (e && e.message ? e.message : e);
+      showDiag(msg);
+      ensurePanel(STATE.videoUrl || '#', msg);
+    } finally {
+      STATE.unlocking = false;
+    }
+  }
+
+  /* ---------------- route / boot ---------------- */
+
+  function onRoute() {
+    if (!/\/play\/video\//i.test(location.href)) return;
+    // 进到播放页才「激活」：亮诊断条、补装 hook、启动观察器、补 viewport
+    // （只在播放页做，不打扰其它网站）
+    showDiag('onRoute');
+    installNetworkHooks();
+    startObserver();
+    ensureMobileViewport();
+    const changed = location.href !== STATE.lastHref;
+    if (changed) {
+      STATE.lastHref = location.href;
+      STATE.played = false;
+      STATE.attached = false;
+      STATE.videoUrl = '';
+      STATE.mediaUrl = '';
+      STATE.unlocking = false;
+      cloneInflight = '';
+      // 切集/切路由：清掉上一集残留的重试与兜底定时器，避免把旧地址挂到新页
+      if (STATE.attachTimer) clearInterval(STATE.attachTimer);
+      if (STATE.readyTimer) clearTimeout(STATE.readyTimer);
+      STATE.attachTimer = null;
+      STATE.readyTimer = null;
+      hideClickOverlay();
+    }
+    resetTrialCounters();
+    // 立刻兜底，不傻等 hook（hook 仍会并行加速）
+    setTimeout(() => fallbackUnlock(false), 200);
+    setTimeout(() => {
+      if (!STATE.videoUrl) fallbackUnlock(false);
+    }, 1500);
+  }
+
+  function hookHistory() {
+    const wrap = (type) => {
+      const raw = history[type];
+      return function () {
+        const ret = raw.apply(this, arguments);
+        try {
+          onRoute();
+        } catch {
+          /* ignore */
+        }
+        return ret;
+      };
+    };
+    history.pushState = wrap('pushState');
+    history.replaceState = wrap('replaceState');
+    window.addEventListener('popstate', onRoute);
+  }
+
+  let moStarted = false;
+  function startObserver() {
+    if (moStarted) return;
+    moStarted = true;
+    // 轻量观察：只隐藏遮罩、必要时重挂 video。用 rAF 合并，避免高频 DOM 变动卡顿。
+    let moScheduled = false;
+    const mo = new MutationObserver(() => {
+      if (moScheduled) return;
+      moScheduled = true;
+      requestAnimationFrame(() => {
+        moScheduled = false;
+        removeVipUi();
+        // 站点若把我们的 video 冲掉，自动重挂
+        if (STATE.mediaUrl && STATE.attached && !document.getElementById('hxc-unlock-video')) {
+          log('video removed by page, re-attach');
+          STATE.attached = false;
+          attachPlayer(STATE.mediaUrl);
+        }
+      });
+    });
+    if (document.documentElement) {
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    }
+  }
+
+  function boot() {
+    // 不再用 isIosSafari 当「是否运行」的开关：iOS 各家脚本管理器、以及 iPhone/iPad
+    // 的「请求桌面网站」会让检测误判成 false，直接导致整个脚本不激活（现象就是
+    // 「电脑能用、iOS 没反应、连面板都不出现」）。检测结果只保留给 IS_IOS_SAFARI
+    // 决定 iOS 专属样式；全站注入，靠 onRoute 内部判断是否播放页再激活重逻辑。
+    hookHistory();
+
+    // document-start 时若已在播放页，尽早装 hook，抢在页面请求之前
+    if (/\/play\/video\//i.test(location.href)) installNetworkHooks();
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', onRoute);
+    } else {
+      onRoute();
+    }
+    window.addEventListener('load', () => {
+      if (!/\/play\/video\//i.test(location.href)) return;
+      showDiag('load');
+      installNetworkHooks();
+      startObserver();
+      removeVipUi();
+      if (!STATE.played) fallbackUnlock(false);
+    });
+  }
+
+  boot();
+})();
