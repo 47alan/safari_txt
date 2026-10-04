@@ -2,8 +2,8 @@
 // @name         常用站点
 // @namespace    quick-sites
 // @version      1.1.0
-// @updateURL    https://raw.githubusercontent.com/47alan/safari_txt/main/%E5%B8%B8%E7%94%A8%E7%AB%99%E7%82%B9.user.js
-// @downloadURL  https://raw.githubusercontent.com/47alan/safari_txt/main/%E5%B8%B8%E7%94%A8%E7%AB%99%E7%82%B9.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B8%B8%E7%94%A8%E7%AB%99%E7%82%B9.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B8%B8%E7%94%A8%E7%AB%99%E7%82%B9.user.js
 // @description  悬浮球菜单里的「常用站点」：轻点即在新标签页打开常去的网站，不用再翻书签；面板里可直接输入网址添加，也可一键加入当前页，删除也在面板里。与广告过滤 / 视频嗅探 / 阅读模式 / NSFW 脚本共用同一个悬浮球。
 // @author       you
 // @match        *://*/*

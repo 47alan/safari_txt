@@ -2,8 +2,8 @@
 // @name         视频嗅探
 // @namespace    safari-video-links
 // @version      1.3.0
-// @updateURL    https://raw.githubusercontent.com/47alan/safari_txt/main/%E8%A7%86%E9%A2%91%E5%97%85%E6%8E%A2.user.js
-// @downloadURL  https://raw.githubusercontent.com/47alan/safari_txt/main/%E8%A7%86%E9%A2%91%E5%97%85%E6%8E%A2.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E8%A7%86%E9%A2%91%E5%97%85%E6%8E%A2.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E8%A7%86%E9%A2%91%E5%97%85%E6%8E%A2.user.js
 // @description  嗅探网页里已加载的视频链接，支持名称/时长及广告筛选。嗅探到视频只点亮悬浮球下方的 ▶ 小圆钮（带数量角标），面板绝不自动弹出，点小圆钮或菜单项才打开；无视频时自动隐藏，与广告过滤等脚本共用悬浮球。适配 iPhone/iPad Safari Userscripts。
 // @match        http://*/*
 // @match        https://*/*

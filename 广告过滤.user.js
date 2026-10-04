@@ -2,8 +2,8 @@
 // @name         隐藏干扰项 Pro（点选隐藏 / 持久拦截）
 // @namespace    https://github.com/yourname/hide-distracting-items
 // @version      1.5.1
-// @updateURL    https://raw.githubusercontent.com/47alan/safari_txt/main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
-// @downloadURL  https://raw.githubusercontent.com/47alan/safari_txt/main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
 // @description  自动过滤常见广告（含 iframe 内部）、拦截弹窗与全屏遮罩，并可点选隐藏任意页面元素，上下层逐级调整选中范围；按网站保存规则，小巧可拖动的悬浮入口，上下箭头一键回顶部 / 到底部，可与 视频嗅探共用。误伤时可随时管理、恢复。
 // @author       you
 // @match        *://*/*
