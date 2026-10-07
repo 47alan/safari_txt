@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         隐藏干扰项 Pro（点选隐藏 / 持久拦截）
 // @namespace    https://github.com/yourname/hide-distracting-items
-// @version      1.5.1
+// @version      1.5.2
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
 // @description  自动过滤常见广告（含 iframe 内部）、拦截弹窗与全屏遮罩，并可点选隐藏任意页面元素，上下层逐级调整选中范围；按网站保存规则，小巧可拖动的悬浮入口，上下箭头一键回顶部 / 到底部，可与 视频嗅探共用。误伤时可随时管理、恢复。
@@ -306,7 +306,7 @@
   }
   // END shared safari tools dock
 
-  const VERSION = '1.5.1'; // 面板上会显示，方便确认装的是不是最新版
+  const VERSION = '1.5.2'; // 面板上会显示，方便确认装的是不是最新版
   const KEY = '__hdi_rules__::' + location.hostname;
   // 三个开关都是「存在=本站被手动关掉」；不存在=默认开启
   const AD_KEY = '__hdi_adfilter_off__';
@@ -803,7 +803,10 @@
       lastGesture = Date.now();
       openedSinceGesture = 0;
       const target = e.target;
-      gestureOnLink = !!(target && target.closest && target.closest('a[href],button,[role="button"],input,summary'));
+      // 点在用户脚本自己的界面（悬浮球、阅读模式等）上不算"点了网页的链接"：这些按钮从不开新窗口，
+      // 却常被 popunder 脚本借作放行的由头
+      gestureOnLink = !!(target && target.closest && !isOurs(target) && !target.closest('#__rd_reader,#__rd_toast') &&
+        target.closest('a[href],button,[role="button"],input,summary'));
     }, true));
 
   const nativeOpen = window.open;

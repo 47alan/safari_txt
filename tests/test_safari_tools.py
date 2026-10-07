@@ -749,6 +749,91 @@ class BrowserTests(unittest.TestCase):
                 self.page.locator(READER_QUICK).click()
                 expect(self.page.locator(READER)).to_be_visible()  # 通用阅读仍然可用。
 
+    POPUNDER_TRICKS = """() => {
+            const tries = [];
+            const attempt = (name, fn) => { try { fn(); tries.push(name); } catch (e) { tries.push(name + ':' + e.message); } };
+            attempt('open', () => window.open('https://ad.test/a'));
+            attempt('iframe', () => {
+                const frame = document.createElement('iframe');
+                document.documentElement.appendChild(frame);
+                frame.contentWindow.open('https://ad.test/b');
+            });
+            attempt('frames', () => window.frames[0].open('https://ad.test/e'));
+            attempt('anchor', () => {
+                const a = document.createElement('a');
+                a.href = 'https://ad.test/c'; a.target = '_blank';
+                document.documentElement.appendChild(a);
+                a.click();
+            });
+            attempt('dispatch', () => {
+                const a = document.createElement('a');
+                a.href = 'https://ad.test/f'; a.target = '_blank';
+                document.documentElement.appendChild(a);
+                a.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            });
+            attempt('form', () => {
+                const form = document.createElement('form');
+                form.action = 'https://ad.test/d'; form.target = '_blank'; form.method = 'get';
+                document.documentElement.appendChild(form);
+                form.submit();
+            });
+            return tries;
+        }"""
+
+    def test_reader_popup_blocker_defeats_popunder_tricks_on_configured_sites(self):
+        # Control first: without a site profile the harness really does open popups, so a leak below would be caught.
+        self.pages = NOVEL_PAGES
+        self.page.goto("https://safari-tools.test/book/7/1.html")
+        self.inject(("reader",))
+        with self.context.expect_page() as opened:
+            self.page.evaluate("window.open('https://ad.test/control')")
+        opened.value.close()
+        self.assertEqual(len(self.context.pages), 1)
+
+        self.pages = {"/12/2.html": SUDUGU_PAGE}
+        for order in (("reader",), ("ads", "reader"), ("reader", "ads")):
+            with self.subTest(order=order):
+                self.page.goto("https://suduguu.com/12/2.html")
+                self.inject(order)
+                expect(self.page.locator(READER)).to_be_visible()
+                self.page.locator("#__rd_bar [data-act='fs+']").click()  # A real tap on the reader must not unlock anything.
+                tries = self.page.evaluate(self.POPUNDER_TRICKS)
+                self.assertEqual(tries, ["open", "iframe", "frames", "anchor", "dispatch", "form"], "Tricks run without throwing")
+                self.page.wait_for_timeout(400)
+                self.assertEqual(len(self.context.pages), 1, "No popunder may open a new page")
+                self.assertTrue(self.page.url.endswith("/12/2.html"), "No trick may navigate the reader away")
+                # The reader's own navigation stays usable: next-page link is same-site and user-clicked.
+                self.assertTrue(self.page.evaluate("""() => {
+                    const a = document.createElement('a'); a.href = '/12/3.html'; a.id = 'own-link';
+                    document.getElementById('__rd_reader').appendChild(a);
+                    let allowed = true;
+                    a.addEventListener('click', e => { allowed = !e.defaultPrevented; e.preventDefault(); });
+                    a.click();
+                    return allowed;
+                }"""), "Same-site links inside the reader are untouched")
+
+    def test_ad_script_does_not_unlock_popups_for_taps_on_userscript_ui(self):
+        # Baseline: a real tap on a page link unlocks exactly one window.open shortly afterwards (unchanged policy).
+        self.load(("ads",))
+        self.page.locator("#normal-link").click()
+        with self.context.expect_page() as opened:
+            self.page.evaluate("window.open('https://ad.test/after-link')")
+        opened.value.close()
+        # But taps on the reader (or any userscript UI) are not page gestures: popunders riding on them stay blocked.
+        self.pages = NOVEL_PAGES
+        self.page.goto("https://safari-tools.test/book/7/1.html")
+        self.inject(("ads", "reader"))
+        self.page.locator(READER_QUICK).click()
+        expect(self.page.locator(READER)).to_be_visible()
+        self.page.locator("#__rd_bar [data-act='fs+']").click()
+        self.page.evaluate("window.open('https://ad.test/after-reader-tap')")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(len(self.context.pages), 1)
+        self.page.locator(LAUNCHER).click()  # The shared dock counts as userscript UI too.
+        self.page.evaluate("window.open('https://ad.test/after-dock-tap')")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(len(self.context.pages), 1)
+
     def test_nsfw_hanxiucao_module_registers_a_dock_entry_only_on_play_pages(self):
         self.load(("ads",))
         self.page.add_script_tag(path=str(NSFW))

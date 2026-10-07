@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阅读模式 Pro（通用正文提取 · 连续翻页 · 进度记忆）
 // @namespace    https://github.com/yourname/reader-mode
-// @version      3.1.0
+// @version      3.1.1
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @description  任意小说 / 文章网页一键进入阅读模式：自动识别正文并去除干扰，自动加载下一页 / 下一章，按段落记忆阅读进度，按网站记住开关、下次自动进入。内置速读谷反劫持与 hl365 去弹窗规则；与隐藏干扰项、视频嗅探共用悬浮球。
@@ -17,7 +17,7 @@
 
   if (window.top !== window.self) return;
 
-  const VERSION = '3.1.0';
+  const VERSION = '3.1.1';
 
   /* ==================================================================
    * ★ 用户配置区：换域名 / 加新站，只改下面这一个 SITES 列表就行。★
@@ -54,7 +54,7 @@
         // 'new-domain.example',          // ← 下次换域名时，在这里加一行
       ],
       content: '.con', title: '.submenu h1', nav: '.prenext',
-      preferFetch: true, autoPath: /\/\d+\/\d+(-\d+)?\.html$/, autoDefault: true, catalogFromPath: true,
+      preferFetch: true, autoPath: /\/\d+\/\d+([-_]\d+)?\.html$/, autoDefault: true, catalogFromPath: true,
       antiHijack: true, blockPopups: true,
       badScripts: /(j2ggdy9|bzau8uk|openjson\d*|jigool|fkt5bpu|06uww3s|2l5xeuu|authlight)/i,
     },
@@ -144,13 +144,107 @@
     }
   }
 
-  // 行为型防护：广告脚本常靠 window.open 弹窗 / 跳第三方。直接封杀它，
-  // 不依赖脚本名，换域名后依然有效。阅读器翻页走 location.href，不受影响。
+  // 行为型防护：广告脚本弹新标签页的手法无非几种 —— 直接 window.open、新建 iframe 借它的
+  // window.open、程序化点击 target=_blank 链接、form.submit 到新窗口、透明诱饵层骗真实点击。
+  // 这里按"行为"逐一拦截，不依赖脚本名，换域名后依然有效。
+  // 阅读器翻页走 location.href，用户亲手点的站内链接不受影响。
   function installPopupBlocker() {
-    const _open = window.open;
-    const fake = function () { blocked++; return null; };
-    try { fake.toString = () => (_open ? Function.prototype.toString.call(_open) : 'function open() { [native code] }'); } catch (e) {}
-    try { window.open = fake; } catch (e) {}
+    const nativeOpen = window.open;
+    const fakeOpen = function () { blocked++; return null; };
+    try { fakeOpen.toString = () => Function.prototype.toString.call(nativeOpen); } catch (e) {}
+
+    function hostOf(url) {
+      try { return new URL(url, location.href).hostname.toLowerCase().replace(/\.$/, ''); } catch (e) { return ''; }
+    }
+    // 站外 = 既不是当前主机，也不属于本站配置里的任何域名
+    function offSite(url) {
+      const host = hostOf(url);
+      if (!host) return false;
+      const own = (location.hostname || '').toLowerCase().replace(/\.$/, '');
+      if (host === own) return false;
+      return !(site.domains || []).some((raw) => {
+        const domain = normalizeDomain(raw);
+        return !!domain && (host === domain || host.endsWith('.' + domain));
+      });
+    }
+    // 透明 / 铺满全屏的 fixed 层：用户以为点的是正文，其实点在诱饵链接上
+    function isDecoy(node) {
+      try {
+        for (let n = node; n && n !== document.body && n !== document.documentElement && n.nodeType === 1; n = n.parentElement) {
+          const cs = getComputedStyle(n);
+          if (parseFloat(cs.opacity) <= 0.05) return true;
+          if (cs.position === 'fixed') {
+            const r = n.getBoundingClientRect();
+            if (r.width >= innerWidth * 0.8 && r.height >= innerHeight * 0.8) return true;
+          }
+        }
+      } catch (e) {}
+      return false;
+    }
+    function guardClick(event) {
+      const node = event.target;
+      const link = node && typeof node.closest === 'function' ? node.closest('a[href],area[href]') : null;
+      if (!link) return;
+      const href = link.getAttribute('href') || '';
+      if (!href || /^(#|javascript:)/i.test(href)) return;
+      const newTab = /^_blank$/i.test(link.getAttribute('target') || '');
+      const away = offSite(link.href);
+      let block = false;
+      if (!event.isTrusted) block = newTab || away;                            // 程序化点击：弹新页 / 跳站外一律拦
+      else if (active && root && !root.contains(link)) block = newTab || away; // 阅读模式下 body 已隐藏，还能被点到的只能是诱饵
+      else if (newTab && away) block = isDecoy(link);                          // 普通页面：透明层上的站外新窗口链接
+      if (!block) return;
+      blocked++;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+    // 给一个 window（当前页或 iframe 里的）装上同一套防护
+    function harden(win) {
+      try {
+        if (!win || win.__rd_popup_guard__) return;
+        win.__rd_popup_guard__ = true;
+        win.open = fakeOpen;
+        win.addEventListener('click', guardClick, true);
+      } catch (e) {} // 跨域 iframe 碰不了，也用不着：它开不了我们这页的新窗口
+    }
+    harden(window);
+
+    // iframe 的 contentWindow 是一个全新的 window，自带原生 open —— 常见绕过手法，一并堵上
+    ['contentWindow', 'contentDocument'].forEach((name) => {
+      try {
+        const desc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, name);
+        if (!desc || !desc.get) return;
+        Object.defineProperty(HTMLIFrameElement.prototype, name, Object.assign({}, desc, {
+          get() {
+            const value = desc.get.call(this);
+            harden(name === 'contentWindow' ? value : (value && value.defaultView));
+            return value;
+          },
+        }));
+      } catch (e) {}
+    });
+    // 通过 frames[0] 直接拿 window 时不经过上面的 getter：新进来的 iframe 主动摸一下，装完即走
+    function hardenFrames(scope) {
+      try {
+        const frames = scope.tagName === 'IFRAME' ? [scope] : Array.from(scope.querySelectorAll ? scope.querySelectorAll('iframe') : []);
+        frames.forEach((frame) => {
+          void frame.contentWindow;
+          frame.addEventListener('load', () => { void frame.contentWindow; }); // 导航后是新 window，再来一次
+        });
+      } catch (e) {}
+    }
+    new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => { if (node.nodeType === 1) hardenFrames(node); }));
+    }).observe(document.documentElement, { childList: true, subtree: true });
+
+    // form.target=_blank + submit() 也是开新窗口的老办法
+    try {
+      const nativeSubmit = HTMLFormElement.prototype.submit;
+      HTMLFormElement.prototype.submit = function () {
+        if (/^_blank$/i.test(this.getAttribute('target') || '')) { blocked++; return; }
+        return nativeSubmit.apply(this, arguments);
+      };
+    } catch (e) {}
   }
 
   if (site.antiHijack) { try { installAntiHijack(); } catch (e) {} }
@@ -733,6 +827,7 @@
   let entryUrl = '', currentUrl = '', originalTitle = '', nextUrl = null, catalogUrl = null;
   let loading = false, stopped = false, autoCount = 0;
   const loadedUrls = new Set();
+  let decoyObserver = null;
 
   function el(tag, props) {
     const node = document.createElement(tag);
@@ -957,6 +1052,10 @@
     const title = titleOf(source.doc, found.el);
     applyVars();
     sweepDecoys();
+    if (site.antiHijack && !decoyObserver) { // 阅读期间诱饵层还会被塞进来：盯住 <html> 的直接子节点，随到随清
+      decoyObserver = new MutationObserver(() => sweepDecoys());
+      decoyObserver.observe(document.documentElement, { childList: true });
+    }
 
     root = el('div', { id: '__rd_reader' });
     root.innerHTML = `
@@ -1015,6 +1114,7 @@
   function teardown() {
     unbindProgress();
     if (io) { io.disconnect(); io = null; }
+    if (decoyObserver) { decoyObserver.disconnect(); decoyObserver = null; }
     if (root) root.remove();
     root = bar = contentBox = statusBox = resumeBox = sentinel = null;
     clearVars();
@@ -1042,6 +1142,7 @@
       return false;
     } finally {
       entering = false;
+      if (!active) scheduleDetect(); // 自动进入没成（如原文 fetch 不通）：重新识别，补上小圆钮或再试一次
     }
   }
 
@@ -1137,14 +1238,16 @@
   /* -------------------- 启动：识别正文 → 显示小圆钮 → 需要时自动进入 --------------------
    * 正文常常是异步渲染的，DOMContentLoaded 时未必在；用去抖的 MutationObserver 再盯 20 秒，
    * 识别到或进入阅读模式后就停手，不常驻。 */
-  let detectTimer = null, detectUntil = 0, detectObserver = null;
+  let detectTimer = null, detectUntil = 0, detectObserver = null, autoTries = 0;
   function detect() {
-    if (active || entering) return;
+    if (active) return;
     let found = null;
     try { found = pickContent(document, location.href); } catch (e) {}
     readable = !!found;
-    syncDock();
-    if (readable && shouldAuto() && !userExited) enterReader({ auto: true });
+    syncDock(); // 哪怕正在 fetch 原文，小圆钮也先亮出来，手动随时能点
+    if (entering || !readable || !shouldAuto() || userExited || autoTries >= 3) return;
+    autoTries++;
+    enterReader({ auto: true });
   }
   function scheduleDetect() {
     if (detectTimer) return;
