@@ -834,6 +834,43 @@ class BrowserTests(unittest.TestCase):
         self.page.wait_for_timeout(300)
         self.assertEqual(len(self.context.pages), 1)
 
+    POPUP_BODY = BASE_BODY + ('<a id="plain-link" href="/other">普通章节链接</a><button id="plain-button">按钮</button>'
+                              '<a id="decoy" href="https://ad.test/decoy" target="_blank" '
+                              'style="position:fixed;inset:0;opacity:0.01;z-index:9999;display:block"></a>')
+
+    def test_ad_script_blocks_popunders_on_any_site_without_a_profile(self):
+        self.load(("ads",), self.POPUP_BODY)
+        self.page.evaluate("document.getElementById('plain-link').addEventListener('click', e => e.preventDefault())")
+        # Tapping an ordinary link: the link navigates by itself, so an off-site window.open riding on it is a popunder.
+        self.page.locator("#plain-link").click()
+        self.page.evaluate("window.open('https://ad.test/after-plain-link')")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(len(self.context.pages), 1)
+        with self.context.expect_page() as opened:  # A same-site popup after a link tap is still allowed once.
+            self.page.evaluate("window.open('/popup')")
+        opened.value.close()
+        # Tapping a button may legitimately open one window (login, share); the second one is blocked.
+        self.page.locator("#plain-button").click()
+        with self.context.expect_page() as opened:
+            self.page.evaluate("window.open('https://share.test/after-button')")
+        opened.value.close()
+        self.page.evaluate("window.open('https://ad.test/second')")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(len(self.context.pages), 1)
+        # Without a fresh gesture every trick is blocked: iframe-borrowed open, synthetic _blank clicks, form.submit.
+        self.page.wait_for_timeout(1300)
+        tries = self.page.evaluate(self.POPUNDER_TRICKS)
+        self.assertEqual(tries, ["open", "iframe", "frames", "anchor", "dispatch", "form"])
+        self.page.wait_for_timeout(400)
+        self.assertEqual(len(self.context.pages), 1)
+        self.assertTrue(self.page.url.endswith("/page"))
+        # A real tap landing on a transparent full-screen decoy link opens nothing either.
+        self.page.mouse.click(200, 500)
+        self.page.wait_for_timeout(400)
+        self.assertEqual(len(self.context.pages), 1)
+        self.assertTrue(self.page.url.endswith("/page"))
+        expect(self.page.locator("#__hdi_toast")).to_contain_text("已拦截自动弹窗")
+
     def test_nsfw_hanxiucao_module_registers_a_dock_entry_only_on_play_pages(self):
         self.load(("ads",))
         self.page.add_script_tag(path=str(NSFW))

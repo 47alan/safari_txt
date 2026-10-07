@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         隐藏干扰项 Pro（点选隐藏 / 持久拦截）
 // @namespace    https://github.com/yourname/hide-distracting-items
-// @version      1.5.2
+// @version      1.6.0
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E5%B9%BF%E5%91%8A%E8%BF%87%E6%BB%A4.user.js
 // @description  自动过滤常见广告（含 iframe 内部）、拦截弹窗与全屏遮罩，并可点选隐藏任意页面元素，上下层逐级调整选中范围；按网站保存规则，小巧可拖动的悬浮入口，上下箭头一键回顶部 / 到底部，可与 视频嗅探共用。误伤时可随时管理、恢复。
@@ -306,7 +306,7 @@
   }
   // END shared safari tools dock
 
-  const VERSION = '1.5.2'; // 面板上会显示，方便确认装的是不是最新版
+  const VERSION = '1.6.0'; // 面板上会显示，方便确认装的是不是最新版
   const KEY = '__hdi_rules__::' + location.hostname;
   // 三个开关都是「存在=本站被手动关掉」；不存在=默认开启
   const AD_KEY = '__hdi_adfilter_off__';
@@ -793,11 +793,16 @@
   setInterval(() => queueScan(), isTop ? 3000 : 6000);
 
   /* ---------------------- 弹窗 / popunder 拦截 ----------------------
-   * 只放行「用户确实点了链接或按钮」之后 1.2 秒内的第一次 window.open，
-   * 点空白处冒出来的新窗口一律挡掉。 */
+   * 只放行「用户确实点了按钮或 JS 链接」之后 1.2 秒内的第一次 window.open。
+   * 点的是普通超链接时链接自己会跳转，没有正当理由再开新窗口 —— popunder 最爱趁这一下，
+   * 所以这种手势只放行站内弹窗。借 iframe 的 window.open、程序化点击 target=_blank 链接、
+   * form.submit 到新窗口、透明诱饵层上的点击，这些绕过手法也一并按行为拦下，不依赖网站名单。 */
   let lastGesture = 0;
-  let gestureOnLink = false;
+  let gestureOnLink = false;    // 点在按钮 / JS 链接上：允许一次正当弹窗（登录、分享之类）
+  let gesturePlainLink = false; // 点在普通超链接上：链接自己会走，只放站内弹窗
   let openedSinceGesture = 0;
+  const plainHref = (el) => { const href = el.getAttribute('href') || ''; return !!href && !/^(#|javascript:)/i.test(href); };
+  const newTabLink = (el) => /^_blank$/i.test(el.getAttribute('target') || '');
   ['pointerdown', 'touchstart', 'keydown'].forEach((type) =>
     document.addEventListener(type, (e) => {
       lastGesture = Date.now();
@@ -805,9 +810,28 @@
       const target = e.target;
       // 点在用户脚本自己的界面（悬浮球、阅读模式等）上不算"点了网页的链接"：这些按钮从不开新窗口，
       // 却常被 popunder 脚本借作放行的由头
-      gestureOnLink = !!(target && target.closest && !isOurs(target) && !target.closest('#__rd_reader,#__rd_toast') &&
-        target.closest('a[href],button,[role="button"],input,summary'));
+      const hit = target && target.closest && !isOurs(target) && !target.closest('#__rd_reader,#__rd_toast') ?
+        target.closest('a[href],button,[role="button"],input,summary') : null;
+      gesturePlainLink = !!(hit && hit.tagName === 'A' && plainHref(hit) && !newTabLink(hit));
+      gestureOnLink = !!hit && !gesturePlainLink;
     }, true));
+
+  function hostOf(url) {
+    try { return new URL(url, location.href).hostname.toLowerCase().replace(/\.$/, ''); } catch (e) { return ''; }
+  }
+  function sameSite(url) {
+    const host = hostOf(url);
+    const own = (location.hostname || '').toLowerCase().replace(/\.$/, '');
+    return !!host && !!own && (host === own || host.endsWith('.' + own) || own.endsWith('.' + host));
+  }
+  function popupAllowed(url) {
+    if (!flagOn(POP_KEY)) return true;
+    const fresh = Date.now() - lastGesture < 1200;
+    // 子框架基本都是广告位，里面弹出来的窗口一律不放行
+    if (!isTop || !fresh || openedSinceGesture >= 1) return false;
+    if (gestureOnLink) return true;
+    return gesturePlainLink && sameSite(url); // 站内链接顺手开站内窗口（目录弹层之类）还是放一次
+  }
 
   const nativeOpen = window.open;
   function stubWindow() {
@@ -815,18 +839,87 @@
       document: { write() {}, writeln() {}, close() {}, open() {} }, location: { href: '', replace() {}, assign() {} } };
     return stub;
   }
-  try {
-    window.open = function (...args) {
-      if (flagOn(POP_KEY)) {
-        const fresh = Date.now() - lastGesture < 1200;
-        // 子框架基本都是广告位，里面弹出来的窗口一律不放行
-        if (!isTop || !fresh || !gestureOnLink || openedSinceGesture >= 1) {
-          toast('已拦截自动弹窗');
-          return stubWindow();
-        }
-        openedSinceGesture++;
+  function guardedOpen(win, open) {
+    return function (...args) {
+      if (!popupAllowed(String(args[0] == null ? '' : args[0]))) {
+        toast('已拦截自动弹窗');
+        return stubWindow();
       }
-      return nativeOpen.apply(window, args);
+      if (flagOn(POP_KEY)) openedSinceGesture++;
+      return open.apply(win, args);
+    };
+  }
+  try { window.open = guardedOpen(window, nativeOpen); } catch (e) {}
+
+  // iframe 的 contentWindow 是一个全新的 window，自带原生 open —— 常见绕过手法，给它套同一套放行规则
+  function hardenFrameWindow(win) {
+    try {
+      if (!win || win === window || win.__hdi_popup_guard__) return;
+      win.__hdi_popup_guard__ = true;
+      win.open = guardedOpen(win, win.open);
+    } catch (e) {} // 跨域 iframe 碰不了，也用不着：它开不了我们这页的新窗口
+  }
+  ['contentWindow', 'contentDocument'].forEach((name) => {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, name);
+      if (!desc || !desc.get) return;
+      Object.defineProperty(HTMLIFrameElement.prototype, name, Object.assign({}, desc, {
+        get() {
+          const value = desc.get.call(this);
+          hardenFrameWindow(name === 'contentWindow' ? value : (value && value.defaultView));
+          return value;
+        },
+      }));
+    } catch (e) {}
+  });
+  // 通过 frames[0] 直接拿 window 时不经过上面的 getter：新进来的 iframe 主动摸一下，装完即走
+  function hardenFrames(scope) {
+    try {
+      const frames = scope.tagName === 'IFRAME' ? [scope] : Array.from(scope.querySelectorAll ? scope.querySelectorAll('iframe') : []);
+      frames.forEach((frame) => {
+        void frame.contentWindow;
+        frame.addEventListener('load', () => { void frame.contentWindow; }); // 导航后是新 window，再来一次
+      });
+    } catch (e) {}
+  }
+  new MutationObserver((records) => {
+    records.forEach((record) => record.addedNodes.forEach((node) => { if (node.nodeType === 1) hardenFrames(node); }));
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // 透明 / 铺满全屏的 fixed 层：用户以为点的是正文，其实点在诱饵链接上
+  function isDecoy(node) {
+    try {
+      for (let n = node; n && n !== document.body && n !== document.documentElement && n.nodeType === 1; n = n.parentElement) {
+        const cs = getComputedStyle(n);
+        if (parseFloat(cs.opacity) <= 0.05) return true;
+        if (cs.position === 'fixed') {
+          const r = n.getBoundingClientRect();
+          if (r.width >= innerWidth * 0.8 && r.height >= innerHeight * 0.8) return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+  // 程序化点击 target=_blank 的站外链接 = 没有用户手势的新窗口；真实点击落在诱饵层上也一样拦
+  window.addEventListener('click', (event) => {
+    if (!flagOn(POP_KEY)) return;
+    const node = event.target;
+    const link = node && typeof node.closest === 'function' ? node.closest('a[href],area[href]') : null;
+    if (!link || isOurs(link) || link.hasAttribute('download') || !plainHref(link) || !newTabLink(link) || sameSite(link.href)) return;
+    if (event.isTrusted && !isDecoy(link)) return;
+    toast('已拦截自动弹窗');
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+  // form.target=_blank + submit() 也是开新窗口的老办法：按同一套手势规则放行
+  try {
+    const nativeSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function () {
+      if (/^_blank$/i.test(this.getAttribute('target') || '') && !popupAllowed(this.getAttribute('action') || location.href)) {
+        toast('已拦截自动弹窗');
+        return;
+      }
+      return nativeSubmit.apply(this, arguments);
     };
   } catch (e) {}
 
