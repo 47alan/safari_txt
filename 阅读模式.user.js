@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阅读模式 Pro（通用正文提取 · 连续翻页 · 进度记忆）
 // @namespace    https://github.com/yourname/reader-mode
-// @version      3.1.2
+// @version      3.2.0
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @description  任意小说 / 文章网页一键进入阅读模式：自动识别正文并去除干扰，自动加载下一页 / 下一章，按段落记忆阅读进度，按网站记住开关、下次自动进入。内置速读谷反劫持与 hl365 去弹窗规则；与隐藏干扰项、视频嗅探共用悬浮球。
@@ -17,7 +17,7 @@
 
   if (window.top !== window.self) return;
 
-  const VERSION = '3.1.2';
+  const VERSION = '3.2.0';
 
   /* ==================================================================
    * ★ 用户配置区：换域名 / 加新站，只改下面这一个 SITES 列表就行。★
@@ -800,11 +800,44 @@
       return new DOMParser().parseFromString(await res.text(), 'text/html');
     } finally { clearTimeout(timer); }
   }
-  async function obtainSource() {
+  // 有的站把分页正文改成用 <script src> 注入（脚本里 document.write 一堆 <p>）。
+  // fetch 抓不到脚本执行结果，这里把脚本本身抓来，取出 document.write 的 HTML 填回正文容器，
+  // 让后面的识别照常进行。只在配置了正文容器（site.content）的站上做，且容器本身没正文时才碰。
+  async function fillInjectedContent(doc, base, timeout) {
+    if (!site.content) return;
+    let container = null;
+    try { container = doc.querySelector(site.content); } catch (e) { return; }
+    if (!container || (container.textContent || '').trim().length >= CONFIG.minChars) return;
+    const script = container.querySelector('script[src]');
+    if (!script) return;
+    const src = resolveUrl(script.getAttribute('src') || '', base);
+    if (!src || !sameSiteUrl(src, base)) return; // 注入脚本必须同站，别去跑第三方脚本
+    let code = '';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout || 10000);
+    try {
+      const res = await fetch(src, { credentials: 'omit', signal: ctrl.signal });
+      if (res.ok) code = await res.text();
+    } catch (e) {} finally { clearTimeout(timer); }
+    if (!code) return;
+    const parts = [];
+    const re = /document\.write(?:ln)?\(\s*(['"`])((?:\\.|[\s\S])*?)\1\s*\)/g;
+    let m;
+    while ((m = re.exec(code))) parts.push(m[2]);
+    if (!parts.length) return;
+    const html = parts.join('').replace(/\\(['"\/\\])/g, '$1').replace(/\\r/g, '').replace(/\\n/g, '\n');
+    try {
+      const holder = doc.createElement('div');
+      holder.innerHTML = html;
+      script.replaceWith(holder);
+    } catch (e) {}
+  }
+    async function obtainSource() {
     if (site.preferFetch && !fetchGaveUp) {
       for (let i = 0; i < 4; i++) {
         try {
           const doc = await fetchDoc(location.href);
+          await fillInjectedContent(doc, location.href);
           if (pickContent(doc, location.href)) return { doc, url: location.href };
         } catch (e) {}
         await new Promise((r) => setTimeout(r, 500 + i * 700));
@@ -924,6 +957,7 @@
     statusBox.innerHTML = '<span class="dot">加载下一页</span>';
     try {
       const doc = await fetchDoc(url, 15000);
+      await fillInjectedContent(doc, url, 10000);
       const found = pickContent(doc, url);
       if (!found) throw new Error('下一页没有识别到正文');
       appendBlock({ url, title: titleOf(doc, found.el), paragraphs: found.paragraphs });

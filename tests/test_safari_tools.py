@@ -651,7 +651,8 @@ class BrowserTests(unittest.TestCase):
         expect(self.page.locator(READER_QUICK)).to_be_hidden()
         self.menu()
         self.page.locator(READER_ENTRY).click()
-        expect(self.page.locator("#__rd_toast")).to_be_visible()
+        # 提示一闪而过（2.2s 后淡出），别赌可见；元素留在 DOM，断言它带了"无正文"文案即可。
+        expect(self.page.locator("#__rd_toast")).to_contain_text("没有识别到")
         expect(self.page.locator(READER)).to_have_count(0)
 
     def test_reader_sudugu_profile_builds_from_fetched_source_automatically(self):
@@ -966,6 +967,27 @@ class BrowserTests(unittest.TestCase):
         expect(self.page.locator("#__rd_status a")).to_have_count(0)
         for link in self.page.locator("#__rd_content a").all():
             self.assertNotIn("ad.evil.test", link.get_attribute("href") or "")
+
+    def test_reader_fills_script_injected_chapter_body(self):
+        # 速读谷新套路：分页正文改由 <script src=/i/a.aspx> 注入（脚本内 document.write 一堆 <p>）。
+        head = '<div class="submenu"><h1>测试书 > 第一章 开端</h1></div>'
+        tail = '<div class="prenext"><a href="/12/9.html">上一页</a><a href="/12/#dir">目录</a>%s</div>'
+        body1 = (head + '<div class="con">' + "".join("<p>" + "第一页静态正文，" * 8 + "</p>" for _ in range(30))
+                 + "</div>" + tail % '<a href="/12/9-2.html">下一页</a>')
+        body2 = head + '<div class="con"><script src="/i/a.aspx?id=9&p=2&bid=12"></script></div>' + tail % ""
+        self.pages = {"/12/9.html": body1, "/12/9-2.html": body2}
+        injected = 'document.write("' + "".join("<p>脚本注入的第二页正文第%d段。</p>" % i for i in range(16)) + '")'
+        self.context.route("**/i/a.aspx*",
+                           lambda route: route.fulfill(content_type="application/javascript; charset=utf-8", body=injected))
+        self.page.goto("https://suduguu.com/12/9.html")
+        self.inject(("reader",))
+        expect(self.page.locator(READER)).to_be_visible()  # 速读谷配置：自动进入
+        expect(self.page.locator("#__rd_content p")).to_have_count(30)
+        self.page.evaluate("scrollTo(0, document.documentElement.scrollHeight)")
+        # 第二分页的正文由脚本注入：脚本被抓取、解析，正文接在后面，不再"加载失败"。
+        expect(self.page.locator("#__rd_content .rd-block")).to_have_count(2)
+        expect(self.page.locator("#__rd_content p")).to_have_count(46)
+        expect(self.page.locator("#__rd_content p").last).to_contain_text("脚本注入的第二页正文")
 
     def test_reader_shares_the_dock_with_the_other_scripts(self):
         self.pages = NOVEL_PAGES
