@@ -945,6 +945,28 @@ class BrowserTests(unittest.TestCase):
         self.page.keyboard.press("Escape")
         expect(self.page.locator("#__quick_sites__ #panel")).to_be_hidden()
 
+    def test_reader_next_link_stays_on_site_and_ignores_ad_decoys(self):
+        # 盗版站套路：真·下一章旁边塞一个也叫"下一页"的广告链接（新标签页 + 站外，最后跳 google）。
+        def chapter(n, last=False):
+            paras = "".join(f"<p>第{n}章正文，" + "阅读模式测试内容，" * 6 + "</p>" for _ in range(30))
+            ad = '<a href="https://ad.evil.test/go?to=https://www.google.com" target="_blank">下一页</a>'
+            real = "" if last else f'<a href="/novel/9/{n + 1}.html">下一章</a>'
+            return f'<h1>第{n}章 测试</h1><div id="content">{paras}</div><div class="pager">{ad}{real}</div>'
+        self.pages = {"/novel/9/1.html": chapter(1), "/novel/9/2.html": chapter(2, last=True)}
+        self.page.goto("https://novel.test/novel/9/1.html")
+        self.inject(("reader",))
+        self.page.locator(READER_QUICK).click()
+        expect(self.page.locator(READER)).to_be_visible()
+        self.page.evaluate("scrollTo(0, document.documentElement.scrollHeight)")
+        expect(self.page.locator("#__rd_content .rd-block")).to_have_count(2)  # 跟进站内下一章，不是广告
+        expect(self.page.locator("#__rd_content .rd-divider")).to_have_text("第2章 测试")
+        # 末章唯一的"下一页"是站外广告：判为最后一页，绝不给出跳站外的链接。
+        self.page.evaluate("scrollTo(0, document.documentElement.scrollHeight)")
+        expect(self.page.locator("#__rd_status")).to_contain_text("最后一页")
+        expect(self.page.locator("#__rd_status a")).to_have_count(0)
+        for link in self.page.locator("#__rd_content a").all():
+            self.assertNotIn("ad.evil.test", link.get_attribute("href") or "")
+
     def test_reader_shares_the_dock_with_the_other_scripts(self):
         self.pages = NOVEL_PAGES
         self.page.goto("https://safari-tools.test/book/7/1.html")

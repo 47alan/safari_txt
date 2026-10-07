@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阅读模式 Pro（通用正文提取 · 连续翻页 · 进度记忆）
 // @namespace    https://github.com/yourname/reader-mode
-// @version      3.1.1
+// @version      3.1.2
 // @updateURL    https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/47alan/safari_txt@main/%E9%98%85%E8%AF%BB%E6%A8%A1%E5%BC%8F.user.js
 // @description  任意小说 / 文章网页一键进入阅读模式：自动识别正文并去除干扰，自动加载下一页 / 下一章，按段落记忆阅读进度，按网站记住开关、下次自动进入。内置速读谷反劫持与 hl365 去弹窗规则；与隐藏干扰项、视频嗅探共用悬浮球。
@@ -17,7 +17,7 @@
 
   if (window.top !== window.self) return;
 
-  const VERSION = '3.1.1';
+  const VERSION = '3.1.2';
 
   /* ==================================================================
    * ★ 用户配置区：换域名 / 加新站，只改下面这一个 SITES 列表就行。★
@@ -735,17 +735,47 @@
   function normalizeText(s) {
     return (s || '').replace(/[\s　]+/g, '').replace(/[【】\[\]()（）]/g, '');
   }
+  // 翻页目标必须留在同一个网站：同主机，或互为子域名（www ↔ m ↔ 根域名）。
+  // 盗版站爱在真·翻页键旁边塞一个"下一页"假链接，指向广告跳转器（最后甩到 google / 应用商店）；
+  // 这类链接几乎都跳去站外，挡住它就不会再被带走。
+  function sameSiteUrl(url, base) {
+    try {
+      const host = new URL(url, base).hostname.toLowerCase().replace(/\.$/, '');
+      const baseHost = new URL(base).hostname.toLowerCase().replace(/\.$/, '');
+      if (!host || !baseHost) return false;
+      if (host === baseHost) return true;
+      const tail = baseHost.split('.').slice(-2).join('.'); // 粗略的注册域名，足够区分站内 / 站外
+      return host === tail || host.endsWith('.' + tail);
+    } catch (e) { return false; }
+  }
+  // 纯符号（> » › →）当翻页键太弱、常是装饰或广告；"下一章/下一页"这种明确文字更可信。
+  function navScore(text) {
+    if (!text) return 0;
+    return /^[>»›→]$/.test(text) ? 1 : 2;
+  }
   function findLink(doc, base, re, rel) {
-    let a = null;
-    if (rel) a = doc.querySelector('link[rel~="' + rel + '"],a[rel~="' + rel + '"]');
-    if (!a && site.nav) {
-      try { a = Array.from(doc.querySelectorAll(site.nav + ' a')).find((x) => re.test(normalizeText(x.textContent))); } catch (e) {}
+    const picks = [];
+    if (rel) {
+      const a = doc.querySelector('link[rel~="' + rel + '"],a[rel~="' + rel + '"]');
+      if (a) picks.push({ a, score: 3 }); // rel=next 是作者明示的，最优先
     }
-    if (!a) a = Array.from(doc.querySelectorAll('a[href]')).find((x) => re.test(normalizeText(x.textContent)));
-    if (!a) return null;
-    const href = a.getAttribute('href') || '';
-    if (!href || /^(#|javascript:)/i.test(href)) return null;
-    return resolveUrl(href, base);
+    let scope = [];
+    if (site.nav) { try { scope = Array.from(doc.querySelectorAll(site.nav + ' a')); } catch (e) {} }
+    const pool = scope.length ? scope : Array.from(doc.querySelectorAll('a[href]'));
+    pool.forEach((a) => {
+      const score = navScore(normalizeText(a.textContent));
+      if (score && re.test(normalizeText(a.textContent))) picks.push({ a, score: score + (scope.length ? 1 : 0) });
+    });
+    let best = null;
+    for (const { a, score } of picks) {
+      const href = a.getAttribute('href') || '';
+      if (!href || /^(#|javascript:)/i.test(href)) continue;
+      if (/^_blank$/i.test(a.getAttribute('target') || '')) continue; // 新标签页的"下一页"基本都是广告
+      const url = resolveUrl(href, base);
+      if (!url || !sameSiteUrl(url, base)) continue;                   // 跳站外的一律不认（挡掉跳 google 的假链接）
+      if (!best || score > best.score) best = { url, score };          // 分高者胜，同分保留文档顺序（第一个）
+    }
+    return best ? best.url : null;
   }
   function findCatalog(doc, base) {
     const url = findLink(doc, base, CATALOG_RE);
